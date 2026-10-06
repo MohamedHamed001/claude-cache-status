@@ -552,7 +552,8 @@ export const register: Register = (on, options) => {
     }
 
     const ratio = hitRatio(last)
-    const wide = columns >= 110
+    // prompt-cache-control's cut-off: from 90 columns the row has room for read / wrote / new.
+    const wide = columns >= 90
     const size = promptTokens(last)
     const isIdle = freshState === 'idle' && !isWarming && !e.props.isWorking
     const icon = advice.kind === 'warm' ? '●' : advice.kind === 'soon' ? '▲' : advice.kind === 'expired' || advice.kind === 'miss' ? '✖' : '○'
@@ -573,7 +574,7 @@ export const register: Register = (on, options) => {
         <Box flexDirection="row" columnGap={1} alignItems="center">
           <Text bold color={color}>{icon}</Text>
           <Text bold color="cyan">cache</Text>
-          <Text color={color}>{bar(ratio, wide ? 10 : 6)}</Text>
+          <Text color={color}>{bar(ratio, 10)}</Text>
           <Text bold>{`${Math.round(ratio * 100)}%`}</Text>
           {wide ? (
             <>

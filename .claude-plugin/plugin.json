@@ -1,6 +1,6 @@
 {
   "name": "cache-status",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "Prompt-cache meter above the prompt, built on prompt-cache-control: read / wrote / new tokens per request, a live countdown, why the cache missed, and pop-ups before it lapses; plus what a re-ingest costs in your 5-hour window, what the cache saved today, Keep warm, Start fresh, and a /cache pane with a per-turn table and history",
   "author": {
     "name": "Mohamed Hamed"
