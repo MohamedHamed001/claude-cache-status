@@ -384,15 +384,22 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column" rowGap={1}>
-        {/* Its own rounded box, one per plugin, so stacked bands stay apart. */}
-        <Box columnGap={1} alignItems="center" borderStyle="round" borderDimColor paddingX={1}>
+        {/* Its own filled card, one per plugin, so stacked bands read as separate. */}
+        <Box columnGap={1} alignItems="center" backgroundColor="userMessageBackground" paddingX={1}>
           <Text color={view.tone}>{view.dot}</Text>
           <Text color={view.tone}>cache</Text>
-          <Text color={view.tone}>{'█'.repeat(cells.filled)}</Text>
-          <Text dimColor>{'░'.repeat(cells.empty)}</Text>
-          {view.hit !== null && <Text>{Math.round(view.hit * 100)}%</Text>}
+          {/* A solid bar: coloured blocks (spaces on a background), not block characters,
+              which the desktop app draws as a dotted pattern. Left out until the hit rate
+              is known (the first request after an update or a /clear). */}
+          {view.hit !== null && (
+            <Box>
+              <Text backgroundColor={view.tone}>{' '.repeat(cells.filled)}</Text>
+              <Text backgroundColor="inactive">{' '.repeat(cells.empty)}</Text>
+            </Box>
+          )}
+          {view.hit !== null && <Text color={view.tone}>{Math.round(view.hit * 100)}%</Text>}
           {view.timer && <Text color={view.tone}>{view.timer} left</Text>}
-          <Box flexGrow={1} flexShrink={1}>
+          <Box flexGrow={1} flexShrink={1} minWidth={0} overflow="hidden">
             <Text dimColor wrap="truncate-end">
               {view.stats} · {state === 'writing' ? 'writing handoff brief…' : state === 'clearing' ? 'clearing…' : view.advice}
             </Text>

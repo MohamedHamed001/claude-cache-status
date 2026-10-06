@@ -1,6 +1,6 @@
 {
   "name": "cache-status",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Shows this session's prompt cache above the prompt: hit rate, countdown to cold, what a re-ingest would cost, and a Start fresh button that hands the work to a cleared conversation",
   "author": {
     "name": "Mohamed Hamed"
