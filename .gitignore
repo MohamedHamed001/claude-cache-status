@@ -1,0 +1,4 @@
+# Written by Claude Code next to a plugin it loads from a folder (type references for
+# editors). Generated per machine and per app version, so not kept in the repo.
+.claude-plugin/types/
+tsconfig.json

@@ -1,0 +1,16 @@
+{
+    "name":  "claude-cache-status",
+    "owner":  {
+                  "name":  "Mohamed Hamed"
+              },
+    "plugins":  [
+                    {
+                        "name":  "cache-status",
+                        "source":  "./",
+                        "description":  "Shows this session\u0027s prompt-cache status above the prompt: time left before it goes cold, context size, and what a re-ingest would cost"
+                    }
+                ],
+    "metadata":  {
+                     "description":  "Shows this session\u0027s prompt-cache status above the prompt: time left before it goes cold, context size, and what a re-ingest would cost"
+                 }
+}

@@ -1,0 +1,11 @@
+{
+  "name": "cache-status",
+  "version": "0.2.0",
+  "description": "Shows this session's prompt-cache status above the prompt: time left before it goes cold, context size, and what a re-ingest would cost",
+  "author": {
+    "name": "Mohamed Hamed"
+  },
+  "types": "./types/index.d.ts",
+  "repository": "https://github.com/MohamedHamed001/claude-cache-status",
+  "license": "MIT"
+}
