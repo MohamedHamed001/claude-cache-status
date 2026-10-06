@@ -20,29 +20,41 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, SessionRateLimit } from 'claude-code'
 
-import type { LastRequest } from '../types'
+import type { Daily, LastRequest } from '../types'
 import {
   BRIEF_PROMPT,
   DEFAULT_BASELINE_TOKENS,
   FIVE_MINUTES_MS,
   ONE_HOUR_MS,
   addSample,
+  addToDaily,
+  addToHistory,
   barCells,
   contextTokens,
   costUnits,
+  dayOf,
   describe,
+  formatPercent,
   formatTokens,
+  hitShare,
+  historyTone,
   isReingest,
   learnTtl,
   learnedRate,
   median,
   promptTokens,
+  savedUnits,
 } from './logic'
 import type { Usage } from './logic'
 
 // Every second, so the countdown shows minutes and seconds.
 const TICK_MS = 1_000
-const BAR_CELLS = 12
+const BAR_CELLS = 10
+// Shared by all sessions: today's saved and re-ingest totals.
+const DAILY_KEY = 'daily'
+// The smallest possible request: it re-reads the conversation from the cache, which
+// restarts the cache's timer, and answers with one word.
+const KEEP_WARM_PROMPT = 'Reply with the single word: ok.'
 // Shared by all sessions: sizes of conversations' first requests, to estimate a fresh start.
 const BASELINE_KEY = 'baseline'
 // A first request bigger than this is a reopened old conversation, not a fresh one.
@@ -66,6 +78,9 @@ const now = atom({ plugin: 'cache-status', key: 'now' } as const, 0)
 const percentPerMillion = atom({ plugin: 'cache-status', key: 'percentPerMillion' } as const, null)
 const baselineTokens = atom({ plugin: 'cache-status', key: 'baselineTokens' } as const, DEFAULT_BASELINE_TOKENS)
 const fresh = atom({ plugin: 'cache-status', key: 'fresh' } as const, 'idle')
+const history = atom({ plugin: 'cache-status', key: 'history' } as const, [])
+const daily = atom({ plugin: 'cache-status', key: 'daily' } as const, null)
+const warming = atom({ plugin: 'cache-status', key: 'warming' } as const, false)
 
 // Plain variables for the turn in progress. They are not drawn, and losing them on a
 // reload only costs one pop-up.
@@ -125,14 +140,59 @@ async function recordRequest($: EngineInterface, usage: Usage & { model: string 
     await learnBaseline($, contextTokens(usage))
   }
 
-  await update($, last, () => ({
-    at: finishedAt,
+  await rememberRequest($, usage, finishedAt, previous !== null && isReingest(usage))
+}
+
+/**
+ * Note one request that read the conversation (a turn's request or a Keep warm): it
+ * restarted the cache timer, adds a cell to the history strip, and counts towards today.
+ */
+async function rememberRequest($: EngineInterface, usage: Usage & { model: string }, at: number, wasReingest: boolean) {
+  const record: LastRequest = {
+    at,
     contextTokens: contextTokens(usage),
     model: usage.model,
     readTokens: usage.cache_read_input_tokens,
     newTokens: usage.input_tokens + usage.cache_creation_input_tokens,
-  }))
-  await update($, now, () => finishedAt)
+  }
+  await update($, last, () => record)
+  await update($, now, () => at)
+  await update($, history, list => addToHistory(list, hitShare(record) ?? 0))
+
+  // Today's totals live in the shared store: other sessions add to them too.
+  const reingest = wasReingest ? costUnits(usage, await read($, ttlMs)) : 0
+  const updated = addToDaily(((await $.store.get(DAILY_KEY)) ?? null) as Daily | null, dayOf(at), savedUnits(usage), reingest)
+  await $.store.set(DAILY_KEY, updated)
+  await update($, daily, () => updated)
+}
+
+/**
+ * "Keep warm": one tiny request over the conversation. Reading it from the cache restarts
+ * the cache's timer (cache hits refresh its lifetime), for about a tenth of the
+ * conversation's size instead of a full re-ingest later.
+ */
+async function keepWarm($: EngineInterface) {
+  if (await read($, warming)) {
+    return
+  }
+  await update($, warming, () => true)
+  try {
+    const reply = await $.model.fork({ prompt: KEEP_WARM_PROMPT })
+    if (!reply.isAnswered || !reply.usage) {
+      $.ui.toast(`Keep warm failed (${reply.isAnswered ? 'no usage' : reply.reason}).`)
+      return
+    }
+    const previous = await read($, last)
+    const usage = { ...reply.usage, model: previous?.model ?? '' }
+    await rememberRequest($, usage, await $.clock.now(), isReingest(usage))
+    const rate = await read($, percentPerMillion)
+    const cost = rate === null ? '' : ` for ≈ ${formatPercent((costUnits(usage, await read($, ttlMs)) / 1_000_000) * rate)}`
+    $.ui.toast(isReingest(usage) ? 'The cache had already gone cold: it was re-read.' : `Cache kept warm${cost}.`)
+  } catch (error) {
+    $.ui.toast(`Keep warm failed: ${error instanceof Error ? error.message : String(error)}`)
+  } finally {
+    await update($, warming, () => false)
+  }
 }
 
 /**
@@ -151,6 +211,7 @@ async function learnBaseline($: EngineInterface, tokens: number) {
 /** A new conversation (after /clear) starts with no cache and no turn in progress. */
 async function forgetConversation($: EngineInterface) {
   await update($, last, () => null)
+  await update($, history, () => [])
   reingestedTokens = 0
   turnUnits = 0
   turnModel = null
@@ -279,6 +340,10 @@ export const register: Register = on => {
       if (baseline.length > 0) {
         await update($, baselineTokens, () => median(baseline))
       }
+
+      const savedDaily = ((await $.store.get(DAILY_KEY)) ?? null) as Daily | null
+      const today = dayOf(await $.clock.now())
+      await update($, daily, () => (savedDaily && savedDaily.day === today ? savedDaily : null))
     } catch {
       // Start with what we have; the first request fills in the rest.
     }
@@ -359,56 +424,65 @@ export const register: Register = on => {
     return result
   })
 
-  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    // Other mods (and the app) may draw here too. Ask for their content first and
-    // put it under our line, so nobody hides anybody.
-    const beneath = await next(e)
+  // The meter lives on the hint line under the prompt, apart from the other plugins' bands
+  // above it. The app's own hint ("? for shortcuts", "esc to interrupt") stays at the end.
+  on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
+    const engineHint = await next(e)
     const record = await read($, last)
-
-    // No request yet in this session, or the app needs the band for a survey.
-    if (!record || e.props.hasSurvey) {
-      return beneath
+    if (!record) {
+      return engineHint // no request yet in this conversation
     }
 
-    const view = describe(
-      record,
-      await read($, ttlMs),
-      await read($, now),
-      e.props.isWorking,
-      await read($, percentPerMillion),
-      await read($, baselineTokens),
-    )
+    const rate = await read($, percentPerMillion)
+    const view = describe(record, await read($, ttlMs), await read($, now), e.props.isWorking, rate, await read($, baselineTokens))
     const state = await read($, fresh)
-    const cells = barCells(view.hit ?? 0, BAR_CELLS)
+    const isWarming = await read($, warming)
+    const strip = await read($, history)
+    const today = await read($, daily)
+    const battery = barCells(view.battery, BAR_CELLS)
     const { Box, Button, Text } = $.ui.resolve(e)
 
+    // "saved ≈ 41% of 5h today" once the rate is known, else in tokens.
+    let saved = ''
+    if (today && today.savedUnits > 0) {
+      saved =
+        rate === null
+          ? `saved ${formatTokens(Math.round(today.savedUnits))} today`
+          : `saved ≈ ${formatPercent((today.savedUnits / 1_000_000) * rate)} of 5h today`
+    }
+    const status =
+      state === 'writing' ? 'writing handoff brief…' : state === 'clearing' ? 'clearing…' : isWarming ? 'keeping warm…' : view.advice
+    const isIdle = state === 'idle' && !isWarming && !e.props.isWorking
+
     return (
-      <Box flexDirection="column" rowGap={1}>
-        {/* Its own filled card, one per plugin, so stacked bands read as separate. */}
-        <Box columnGap={1} alignItems="center" backgroundColor="userMessageBackground" paddingX={1}>
-          <Text color={view.tone}>{view.dot}</Text>
-          <Text color={view.tone}>cache</Text>
-          {/* A solid bar: coloured blocks (spaces on a background), not block characters,
-              which the desktop app draws as a dotted pattern. Left out until the hit rate
-              is known (the first request after an update or a /clear). */}
-          {view.hit !== null && (
-            <Box>
-              <Text backgroundColor={view.tone}>{' '.repeat(cells.filled)}</Text>
-              <Text backgroundColor="inactive">{' '.repeat(cells.empty)}</Text>
-            </Box>
-          )}
-          {view.hit !== null && <Text color={view.tone}>{Math.round(view.hit * 100)}%</Text>}
-          {view.timer && <Text color={view.tone}>{view.timer} left</Text>}
-          <Box flexGrow={1} flexShrink={1} minWidth={0} overflow="hidden">
-            <Text dimColor wrap="truncate-end">
-              {view.stats} · {state === 'writing' ? 'writing handoff brief…' : state === 'clearing' ? 'clearing…' : view.advice}
-            </Text>
-          </Box>
-          {state === 'idle' && !e.props.isWorking && (
-            <Button key="cache-start-fresh" label="Start fresh" onPress={() => startFresh($)} />
-          )}
+      <Box columnGap={1} alignItems="center">
+        <Text color={view.tone}>{view.dot}</Text>
+        <Text color={view.tone}>cache</Text>
+        {/* The battery: time left, draining and changing colour as the cache runs out. Solid
+            blocks (spaces on a background): the desktop app draws block characters dotted. */}
+        <Box>
+          <Text backgroundColor={view.tone}>{' '.repeat(battery.filled)}</Text>
+          <Text backgroundColor="inactive">{' '.repeat(battery.empty)}</Text>
         </Box>
-        {beneath}
+        {view.timer && <Text color={view.tone}>{view.timer}</Text>}
+        {/* History: one cell per recent request; red marks a re-ingest. */}
+        {strip.length > 1 && (
+          <Box>
+            {strip.map((hit, index) => (
+              <Text key={`h${index}`} backgroundColor={historyTone(hit)}>
+                {' '}
+              </Text>
+            ))}
+          </Box>
+        )}
+        <Box flexGrow={1} flexShrink={1} minWidth={0} overflow="hidden">
+          <Text dimColor wrap="truncate-end">
+            {[view.stats, status, saved].filter(Boolean).join(' · ')}
+          </Text>
+        </Box>
+        {isIdle && view.isEnding && <Button key="cache-keep-warm" label="Keep warm" onPress={() => keepWarm($)} />}
+        {isIdle && <Button key="cache-start-fresh" label="Start fresh" onPress={() => startFresh($)} />}
+        {engineHint}
       </Box>
     )
   })

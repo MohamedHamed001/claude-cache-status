@@ -7,6 +7,12 @@ import {
   FIVE_MINUTES_MS,
   ONE_HOUR_MS,
   addSample,
+  addToDaily,
+  addToHistory,
+  batteryShare,
+  historyTone,
+  payoffRequests,
+  savedUnits,
   contextTokens,
   costUnits,
   barCells,
@@ -133,56 +139,82 @@ test('clock: minutes and seconds, hours when the full hour is left', () => {
   expect(formatClock(-1)).toBe('0:00')
 })
 
-test('hit share and bar: how much of the last request came from the cache', () => {
+test('hit share and bar cells', () => {
   expect(Math.round((hitShare(LAST) ?? 0) * 1000)).toBe(992)
   expect(hitShare({ at: 0, contextTokens: 1, model: 'm' })).toBe(null) // older saved record
   expect(barCells(0.99, 12)).toEqual({ filled: 12, empty: 0 })
-  expect(barCells(0.5, 12)).toEqual({ filled: 6, empty: 6 })
+  expect(barCells(0.5, 10)).toEqual({ filled: 5, empty: 5 })
   expect(barCells(1.5, 12)).toEqual({ filled: 12, empty: 0 })
 })
 
-test('band: warm with the countdown and the token split', () => {
+test('battery: the share of the lifetime left, drained to zero once cold', () => {
+  expect(batteryShare(30 * MINUTE, ONE_HOUR_MS)).toBe(0.5)
+  expect(batteryShare(-1, ONE_HOUR_MS)).toBe(0)
+  expect(describe(LAST, ONE_HOUR_MS, LAST.at + 45 * MINUTE, false, null).battery).toBe(0.25)
+  expect(describe(LAST, ONE_HOUR_MS, LAST.at + 61 * MINUTE, false, null).battery).toBe(0)
+})
+
+test('meter: warm with the countdown and hit rate', () => {
   expect(describe(LAST, ONE_HOUR_MS, LAST.at + 18 * MINUTE, false, null)).toMatchObject({
     dot: '●',
     tone: 'success',
-    stats: '186k ctx · read 184k · new 2k',
     timer: '42:00',
-    advice: 'warm: keep going',
+    stats: '186k ctx · hit 99%',
+    advice: 'warm',
+    isEnding: false,
   })
 })
 
-test('band: in the last five minutes it says to send now or start fresh while cheap', () => {
-  // Fresh start while warm: 186k read at 0.1 + 2k brief at 5 + 32k new start at 2 = 92.6k units.
+test('meter: in the last five minutes it says what is at stake and offers Keep warm', () => {
   const view = describe(LAST, ONE_HOUR_MS, LAST.at + 57 * MINUTE, false, 8)
   expect(view.tone).toBe('warning')
   expect(view.timer).toBe('3:00')
-  expect(view.advice).toBe('send now to keep it warm, or start fresh while it is cheap (≈ 0.7%)')
+  expect(view.isEnding).toBe(true)
+  // 186k context x2 = 372k units; at 8% per million that is about 3.0%.
+  expect(view.advice).toBe('going cold: 3.0% of 5h at stake')
 })
 
-test('band: cold says what the next message will cost', () => {
-  // 186k context x2 = 372k units; at 8% per million that is about 3.0%.
+test('meter: cold says what the next message will cost', () => {
   expect(describe(LAST, ONE_HOUR_MS, LAST.at + 61 * MINUTE, false, 8)).toMatchObject({
     dot: '○',
     tone: 'error',
-    hit: 0,
     timer: null,
     advice: 'cold: next message re-reads 186k ≈ 3.0% of 5h',
   })
 })
 
-test('band: no countdown while a turn is running', () => {
+test('meter: no countdown while a turn is running', () => {
   expect(describe(LAST, ONE_HOUR_MS, LAST.at + 61 * MINUTE, true, 8)).toMatchObject({ timer: null, advice: 'in use' })
 })
 
-test('band: with a learned rate, the warm line shows the cost of letting it go cold', () => {
-  expect(describe(LAST, ONE_HOUR_MS, LAST.at + 18 * MINUTE, false, 8).stats).toBe(
-    '186k ctx · read 184k · new 2k · re-ingest ≈ 3.0%',
+test('meter: a big conversation says when a fresh start pays off', () => {
+  // 411k context, 30k baseline: a warm fresh start costs 41.1k + 10k + 64k = 115.1k units;
+  // each later request saves (411k - 30k) x 0.1 = 38.1k, so it pays off after 4 requests.
+  const big = { ...LAST, contextTokens: 411_000 }
+  expect(payoffRequests(411_000, 30_000, ONE_HOUR_MS)).toBe(4)
+  expect(describe(big, ONE_HOUR_MS, big.at + 18 * MINUTE, false, null).advice).toBe(
+    'big context: a fresh start pays off after ~4 requests',
   )
 })
 
 test('a fresh start costs far less while warm than once cold', () => {
-  const warm = freshStartUnits(186_000, 30_000, ONE_HOUR_MS, true)
-  const cold = freshStartUnits(186_000, 30_000, ONE_HOUR_MS, false)
-  expect(warm).toBe(92_600)
-  expect(cold).toBe(186_000 * 2 + 10_000 + 64_000)
+  expect(freshStartUnits(186_000, 30_000, ONE_HOUR_MS, true)).toBe(92_600)
+  expect(freshStartUnits(186_000, 30_000, ONE_HOUR_MS, false)).toBe(186_000 * 2 + 10_000 + 64_000)
+})
+
+test('history: colours by hit share, keeps the last twelve', () => {
+  expect(historyTone(0.99)).toBe('success')
+  expect(historyTone(0.5)).toBe('warning')
+  expect(historyTone(0.02)).toBe('error')
+  const long = Array.from({ length: 12 }, () => 1)
+  expect(addToHistory(long, 0)).toEqual([...long.slice(1), 0])
+})
+
+test('today: saved units add up per day and a new day starts over', () => {
+  // 100k tokens read from the cache saved 100k x (1 - 0.1) = 90k units.
+  expect(savedUnits(usage({ cache_read_input_tokens: 100_000 }))).toBe(90_000)
+  const first = addToDaily(null, '2026-10-07', 90_000, 0)
+  const second = addToDaily(first, '2026-10-07', 10_000, 372_000)
+  expect(second).toEqual({ day: '2026-10-07', savedUnits: 100_000, reingestUnits: 372_000, reingests: 1 })
+  expect(addToDaily(second, '2026-10-08', 5, 0)).toEqual({ day: '2026-10-08', savedUnits: 5, reingestUnits: 0, reingests: 0 })
 })

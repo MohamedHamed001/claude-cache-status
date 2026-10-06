@@ -16,6 +16,9 @@ export type LastRequest = {
   newTokens?: number
 }
 
+/** Today's totals, shared by all sessions on this machine. */
+export type Daily = { day: string; savedUnits: number; reingestUnits: number; reingests: number }
+
 /** Where a "Start fresh" press is: nothing running, writing the brief, or clearing. */
 export type FreshState = 'idle' | 'writing' | 'clearing'
 
@@ -37,6 +40,12 @@ declare module 'claude-code' {
       baselineTokens: number
       /** Progress of a "Start fresh" press. */
       fresh: FreshState
+      /** Hit share (0 to 1) of this conversation's recent requests, oldest first. */
+      history: number[]
+      /** Today's totals across sessions: cost units the cache saved and re-ingests cost. */
+      daily: Daily | null
+      /** True while a Keep warm request is running. */
+      warming: boolean
     }
   }
 }

@@ -2,7 +2,7 @@
 // Keeping them here means they can be tested on their own (see logic.test.ts) and
 // register.tsx is left with only the wiring: which event calls which rule.
 
-import type { LastRequest } from '../types'
+import type { Daily, LastRequest } from '../types'
 
 export const FIVE_MINUTES_MS = 5 * 60 * 1000
 export const ONE_HOUR_MS = 60 * 60 * 1000
@@ -247,16 +247,20 @@ export type BandView = {
   tone: 'success' | 'warning' | 'error'
   /** Share of the last request read from the cache, or null when unknown. */
   hit: number | null
-  /** "186k ctx · read 184k · new 1.5k" */
-  stats: string
+  /** Share of the cache's lifetime left, 0 to 1: the battery's charge (0 once cold). */
+  battery: number
   /** "54:36" while warm; null while a turn runs or once cold. */
   timer: string | null
+  /** "411k ctx · hit 99%" */
+  stats: string
   /** One short piece of advice: what to do now. */
   advice: string
+  /** True in the last five minutes: the Keep warm button is worth showing. */
+  isEnding: boolean
 }
 
 /**
- * Turn the last request into the band.
+ * Turn the last request into the meter.
  * `percentPerMillion` is the learned rate; without it no percentages are shown.
  */
 export function describe(
@@ -268,18 +272,15 @@ export function describe(
   baselineTokens: number = DEFAULT_BASELINE_TOKENS,
 ): BandView {
   const size = formatTokens(last.contextTokens)
-  const parts = [`${size} ctx`]
-  if (last.readTokens !== undefined && last.newTokens !== undefined) {
-    parts.push(`read ${formatTokens(last.readTokens)}`, `new ${formatTokens(last.newTokens)}`)
-  }
+  const hit = hitShare(last)
+  const stats = hit === null ? `${size} ctx` : `${size} ctx · hit ${Math.round(hit * 100)}%`
   const percentOf = (units: number) =>
     percentPerMillion === null ? null : formatPercent((units / 1_000_000) * percentPerMillion)
   const reingestCost = percentOf(reingestUnits(last.contextTokens, ttlMs))
-  const hit = hitShare(last)
 
   // While a turn runs, every request restarts the timer, so there is no countdown.
   if (isWorking) {
-    return { dot: '●', tone: 'success', hit, stats: parts.join(' · '), timer: null, advice: 'in use' }
+    return { dot: '●', tone: 'success', hit, battery: 1, timer: null, stats, advice: 'in use', isEnding: false }
   }
 
   const left = last.at + ttlMs - now
@@ -288,26 +289,97 @@ export function describe(
       dot: '○',
       tone: 'error',
       hit: 0,
-      stats: parts.join(' · '),
+      battery: 0,
       timer: null,
+      stats: `${size} ctx`,
       advice: `cold: next message re-reads ${size}` + (reingestCost ? ` ≈ ${reingestCost} of 5h` : ''),
+      isEnding: false,
     }
   }
 
-  const lastMinutes = left < FIVE_MINUTES_MS
-  const freshCost = percentOf(freshStartUnits(last.contextTokens, baselineTokens, ttlMs, true))
-  if (reingestCost) {
-    parts.push(`re-ingest ≈ ${reingestCost}`)
+  const isEnding = left < FIVE_MINUTES_MS
+  const payoff = payoffRequests(last.contextTokens, baselineTokens, ttlMs)
+  let advice = 'warm'
+  if (isEnding) {
+    advice = reingestCost ? `going cold: ${reingestCost} of 5h at stake` : 'going cold: send now or keep warm'
+  } else if (last.contextTokens > BIG_CONTEXT_TOKENS && Number.isFinite(payoff)) {
+    advice = `big context: a fresh start pays off after ~${payoff} requests`
   }
 
   return {
     dot: '●',
-    tone: lastMinutes ? 'warning' : 'success',
+    tone: isEnding ? 'warning' : 'success',
     hit,
-    stats: parts.join(' · '),
+    battery: batteryShare(left, ttlMs),
     timer: formatClock(left),
-    advice: lastMinutes
-      ? 'send now to keep it warm, or start fresh while it is cheap' + (freshCost ? ` (≈ ${freshCost})` : '')
-      : 'warm: keep going',
+    stats,
+    advice,
+    isEnding,
   }
+}
+
+// ---------------------------------------------------------------------------
+// The meter's extras: a draining battery, a per-request history strip, what the cache
+// saved today, and a warning when the conversation is so big a fresh start pays off fast.
+// ---------------------------------------------------------------------------
+
+/** Share of the cache's lifetime still left, 0 to 1: the battery's charge. */
+export function batteryShare(leftMs: number, ttlMs: number): number {
+  return Math.min(1, Math.max(0, leftMs / ttlMs))
+}
+
+/** How many past requests the history strip shows. */
+export const HISTORY_LENGTH = 12
+
+/** One request's colour in the history strip: mostly cached, partly, or a re-ingest. */
+export function historyTone(hit: number): 'success' | 'warning' | 'error' {
+  return hit >= 0.75 ? 'success' : hit >= 0.25 ? 'warning' : 'error'
+}
+
+/** Add one request's hit share to the history, keeping the most recent ones. */
+export function addToHistory(history: readonly number[], hit: number): number[] {
+  return [...history, hit].slice(-HISTORY_LENGTH)
+}
+
+/**
+ * Cost units the cache saved on one request: every token it served would otherwise have
+ * been processed fresh (weight 1) instead of read from the cache (weight 0.1).
+ */
+export function savedUnits(usage: Usage): number {
+  return usage.cache_read_input_tokens * (WEIGHT_FRESH_INPUT - WEIGHT_CACHE_READ)
+}
+
+/** The calendar day of a time, as YYYY-MM-DD in local time. */
+export function dayOf(ms: number): string {
+  const d = new Date(ms)
+
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+/** Add one request to today's totals; a new day starts from zero. */
+export function addToDaily(daily: Daily | null, day: string, saved: number, reingest: number): Daily {
+  const base = daily && daily.day === day ? daily : { day, savedUnits: 0, reingestUnits: 0, reingests: 0 }
+
+  return {
+    day,
+    savedUnits: base.savedUnits + saved,
+    reingestUnits: base.reingestUnits + reingest,
+    reingests: base.reingests + (reingest > 0 ? 1 : 0),
+  }
+}
+
+/** Above this size every request is expensive enough that starting fresh is worth a look. */
+export const BIG_CONTEXT_TOKENS = 300_000
+
+/**
+ * After how many requests a fresh start (made now, while warm) has paid for itself: each
+ * later request re-reads the baseline instead of the whole conversation.
+ */
+export function payoffRequests(contextTokenCount: number, baselineTokens: number, ttlMs: number): number {
+  const savedPerRequest = (contextTokenCount - baselineTokens) * WEIGHT_CACHE_READ
+  if (savedPerRequest <= 0) {
+    return Infinity
+  }
+
+  return Math.ceil(freshStartUnits(contextTokenCount, baselineTokens, ttlMs, true) / savedPerRequest)
 }

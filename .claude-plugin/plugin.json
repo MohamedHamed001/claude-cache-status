@@ -1,7 +1,7 @@
 {
   "name": "cache-status",
-  "version": "0.3.1",
-  "description": "Shows this session's prompt cache above the prompt: hit rate, countdown to cold, what a re-ingest would cost, and a Start fresh button that hands the work to a cleared conversation",
+  "version": "0.4.0",
+  "description": "A cache meter under the prompt: a draining battery and countdown, a per-request history strip, what the cache saved today, Keep warm, and a Start fresh button that hands the work to a cleared conversation",
   "author": {
     "name": "Mohamed Hamed"
   },

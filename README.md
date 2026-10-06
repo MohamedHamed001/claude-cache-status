@@ -24,7 +24,7 @@ Then start a new session: a session reads its plugins once, when it starts. Upda
 
 ## What it does
 
-One line above the prompt showing the prompt cache for the current session.
+A meter under the prompt showing the prompt cache for the current session.
 
 **What the prompt cache is.** Every message re-sends the whole conversation to the model. The
 server keeps the already-processed conversation for a while, so the next message only pays a
@@ -34,30 +34,37 @@ re-ingest. Every request restarts the timer.
 
 **What you see.**
 
-One line in its own box above the prompt:
+One line on the hint line under the prompt, apart from other plugins' bands above it. The app's
+own hint (`? for shortcuts`, `esc to interrupt`) stays at its end.
 
 ```
-● cache ████████████ 99%  42:00 left  186k ctx · read 184k · new 2k · re-ingest ≈ 3.0% · warm: keep going  [ Start fresh ]
+● cache [■■■■■■■   ] 42:00 [▪▪▪▪▪▪▪▪▪▪▪▪] 411k ctx · hit 99% · warm · saved ≈ 41% of 5h today  [Start fresh]
 ```
 
 | Part | Means |
 |---|---|
-| Bar and `99%` | Share of the last request read from the cache: near 100% means the cache is doing its job |
-| `42:00 left` | Countdown until the cache goes cold (an estimate, see below) |
-| `186k ctx · read 184k · new 2k` | Conversation size, and how the last request split between cache and fresh tokens |
-| `re-ingest ≈ 3.0%` | Share of your 5-hour window the next message would use if the cache went cold |
-| Advice | `warm: keep going`; in the last 5 minutes (amber) `send now to keep it warm, or start fresh while it is cheap (≈ 0.7%)`; once cold (red) `next message re-reads 186k ≈ 3.0% of 5h` |
+| Battery | Time left before the cache goes cold, draining and turning amber, then red. Drawn as solid colour blocks |
+| `42:00` | The countdown, minutes and seconds (an estimate, see below) |
+| History strip | One cell per recent request: green read from the cache, amber partly, red a re-ingest |
+| `411k ctx · hit 99%` | Conversation size, and the share of the last request read from the cache |
+| Advice | `warm`; past 300k tokens, `big context: a fresh start pays off after ~4 requests`; in the last 5 minutes `going cold: 3.0% of 5h at stake`; once cold `cold: next message re-reads 411k ≈ 3.0% of 5h` |
+| `saved ≈ 41% of 5h today` | What the cache saved today across your sessions: every token it served would otherwise have been processed fresh. In tokens until the rate is learned |
 | After a re-ingest | pop-up: `Cache was cold: re-ingested 186k tokens. 5h window 41% → 44% this turn.` |
 
 The percentages appear once it has seen enough of your turns to estimate them.
+
+**Keep warm** (last 5 minutes). One tiny request over the conversation, read from the cache. A
+cache hit restarts the cache's lifetime, so for about a tenth of the conversation's size it buys
+another full lifetime instead of a full re-ingest later.
 
 **Start fresh.** One press: Claude writes a handoff brief (goal, what is done, files, decisions,
 open questions, next step), the conversation is cleared with `/clear`, and the brief is sent as
 the new conversation's first message. If the brief cannot be written, nothing is cleared.
 
 Writing the brief reads the whole conversation once: cheap while the cache is warm, a full
-re-ingest once it is cold. So the best time to start fresh is while it is still warm; the band
-says so in its last five minutes.
+re-ingest once it is cold. So start fresh while it is still warm. For a big conversation the
+meter says after how many requests a fresh start has paid for itself: each later request re-reads
+a small new conversation instead of the big one.
 
 **What is exact and what is estimated.**
 
