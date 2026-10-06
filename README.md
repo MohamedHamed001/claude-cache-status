@@ -48,7 +48,8 @@ One row above the prompt:
 | Part | Means |
 |---|---|
 | Bar and `99%` | Share of the last request read from the cache |
-| `read · wrote · new` | The last request: served by the cache, written to it, sent uncached (a narrow window shows the total instead) |
+| `712k tok` | The conversation size; the read / wrote / new split is in the pane |
+| **Cache** button | Opens the /cache pane (the band hides while it is open) |
 | `⏱ 42:00` | Time left, counted from the start of the last request; green, yellow below 40% of the lifetime, red in the last minute |
 | `1h` | The cache lifetime in use (see below) |
 | Advice | What to do: keep going, send a message soon, start fresh or `/compact`, or why the cache missed |

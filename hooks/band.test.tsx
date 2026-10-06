@@ -6,11 +6,11 @@ import { expect, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-type Calls = { ran: string[]; sent: string[]; toasts: string[] }
+type Calls = { ran: string[]; sent: string[]; toasts: string[]; opened: string[] }
 
 /** The engine beneath the plugin: one main request that read 80k from the cache. */
 function fakeEngine(on: On, fork: object = { isAnswered: true, text: 'Goal: ship it.' }, saved?: object): Calls {
-  const calls: Calls = { ran: [], sent: [], toasts: [] }
+  const calls: Calls = { ran: [], sent: [], toasts: [], opened: [] }
   on('session.usage', () => ({ value: { startedAt: 0, context: {}, rateLimits: [{ kind: 'five_hour', percentUsed: 40 }] } }) as never)
   on('session.start', async ($, e) => ({ cwd: e.cwd }) as never)
   on('session.cwd', () => ({ value: 'D:/repo' }) as never)
@@ -24,7 +24,11 @@ function fakeEngine(on: On, fork: object = { isAnswered: true, text: 'Goal: ship
   on('command.register', () => ({ value: undefined }) as never)
   on('clock.every', () => ({ value: undefined }) as never)
   on('ui.invalidate', () => ({ value: undefined }) as never)
-  on('ui.open', () => ({ value: undefined }) as never)
+  on('ui.open', ($, e) => {
+    calls.opened.push(String((e as { id: unknown }).id))
+
+    return { value: undefined } as never
+  })
   on('ui.close', () => ({ value: undefined }) as never)
   on('ui.toast', ($, e) => {
     calls.toasts.push(String((e as { text: unknown }).text))
@@ -86,8 +90,10 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await step($)
     ui = await band($, surface)
     expect((await ui.find({ text: /98%/ })) !== undefined).toBe(true)
-    expect((await ui.find({ text: /read 80k/ })) !== undefined).toBe(true)
-    expect((await ui.find({ text: /wrote 1k/ })) !== undefined).toBe(true)
+    // 80k read + 1k wrote + 300 new, as one size; the split is in the pane.
+    expect((await ui.find({ text: /81\.3k tok/ })) !== undefined).toBe(true)
+    expect((await ui.find({ text: /read 80k/ })) === undefined).toBe(true)
+    expect((await ui.find({ key: 'open-cache' })) !== undefined).toBe(true)
     expect((await ui.find({ text: /⏱/ })) !== undefined).toBe(true)
     expect((await ui.find({ text: /warm: keep going/ })) !== undefined).toBe(true)
     expect((await ui.find({ text: /OTHERS/ })) !== undefined).toBe(true)
@@ -99,7 +105,16 @@ test('a reopened session shows its meter at once, from its saved last request', 
   fakeEngine(on, undefined, { s1: last })
   await $.session.start({ cwd: 'D:/repo', surface: 'desktop', isInteractive: true } as never)
   const ui = await band($, 'desktop')
-  expect((await ui.find({ text: /read 300k/ })) !== undefined).toBe(true)
+  expect((await ui.find({ text: /302k tok/ })) !== undefined).toBe(true)
+})
+
+test('the Cache button opens the /cache pane', async ($, on) => {
+  const calls = fakeEngine(on)
+  await $.session.start({ cwd: 'D:/repo', surface: 'desktop', isInteractive: true } as never)
+  await step($)
+  const ui = await band($, 'desktop')
+  await ui.press({ key: 'open-cache' })
+  expect(calls.opened).toEqual(['cache'])
 })
 
 // warnSeconds above the lifetime puts the cache in its last stretch at once.

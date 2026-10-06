@@ -341,6 +341,13 @@ async function finishTurn($: EngineInterface) {
   }
 }
 
+/** Open the /cache pane. The band hides while it is open: the pane says more. */
+async function openPane($: EngineInterface) {
+  isPaneOpen = true
+  await $.ui.open({ id: PANE, title: 'Cache', focus: true })
+  $.ui.invalidate('ui.render')
+}
+
 /** A /clear starts a new conversation: its cache is a new one. */
 function forgetConversation() {
   samples = []
@@ -515,9 +522,7 @@ export const register: Register = (on, options) => {
 
       return { text: 'Cache pane closed.' }
     }
-    isPaneOpen = true
-    await $.ui.open({ id: PANE, title: 'Cache', focus: true })
-    $.ui.invalidate('ui.render')
+    await openPane($)
     const { advice } = current(policy, Date.now())
 
     return { text: `${ttl} cache (${ttlSource}) · ${advice.text}` }
@@ -552,7 +557,7 @@ export const register: Register = (on, options) => {
     }
 
     const ratio = hitRatio(last)
-    // prompt-cache-control's cut-off: from 90 columns the row has room for read / wrote / new.
+    // From 90 columns the row has room for today's savings after the advice.
     const wide = columns >= 90
     const size = promptTokens(last)
     const isIdle = freshState === 'idle' && !isWarming && !e.props.isWorking
@@ -576,15 +581,8 @@ export const register: Register = (on, options) => {
           <Text bold color="cyan">cache</Text>
           <Text color={color}>{bar(ratio, 10)}</Text>
           <Text bold>{`${Math.round(ratio * 100)}%`}</Text>
-          {wide ? (
-            <>
-              <Text color="green">{`read ${fmtTokens(last.read)}`}</Text>
-              <Text color="yellow">{`wrote ${fmtTokens(last.write)}`}</Text>
-              <Text color="cyan">{`new ${fmtTokens(last.fresh)}`}</Text>
-            </>
-          ) : (
-            <Text dimColor>{`${fmtTokens(size)} tok`}</Text>
-          )}
+          {/* The conversation's size; the read / wrote / new split is in the pane. */}
+          <Text dimColor>{`${fmtTokens(size)} tok`}</Text>
           {advice.kind !== 'uncached' && advice.kind !== 'off' && (
             <Text bold color={left > 0 ? lifeColor(left, ttl, policy.warnMs) : 'red'}>{left > 0 ? `⏱ ${fmtClock(left)}` : '⏱ 0:00'}</Text>
           )}
@@ -595,6 +593,7 @@ export const register: Register = (on, options) => {
           {isIdle && advice.kind === 'expired' && size >= policy.compactAtTokens && (
             <Button key="cache-start-fresh" label="Start fresh" onPress={() => startFresh($)} />
           )}
+          <Button key="open-cache" label="Cache" onPress={() => openPane($)} />
         </Box>
         {beneath}
       </Box>
