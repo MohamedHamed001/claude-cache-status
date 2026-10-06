@@ -1,11 +1,42 @@
 {
   "name": "cache-status",
-  "version": "0.4.1",
-  "description": "A cache meter under the prompt: a draining battery and countdown, a per-request history strip, what the cache saved today, Keep warm, and a Start fresh button that hands the work to a cleared conversation",
+  "version": "0.5.0",
+  "description": "Prompt-cache meter above the prompt, built on prompt-cache-control: read / wrote / new tokens per request, a live countdown, why the cache missed, and pop-ups before it lapses; plus what a re-ingest costs in your 5-hour window, what the cache saved today, Keep warm, Start fresh, and a /cache pane with a per-turn table and history",
   "author": {
     "name": "Mohamed Hamed"
   },
   "types": "./types/index.d.ts",
   "repository": "https://github.com/MohamedHamed001/claude-cache-status",
-  "license": "MIT"
+  "license": "MIT",
+  "userConfig": {
+    "ttl": {
+      "type": "string",
+      "title": "Cache lifetime",
+      "description": "auto follows Claude Code's own rules (FORCE_PROMPT_CACHING_5M, CLAUDE_CODE_PROMPT_CACHE_TTL, the promptCacheTtl setting, ENABLE_PROMPT_CACHING_1H, then 1 hour on a Claude subscription and 5 minutes otherwise) and corrects itself from request timing; 5m or 1h pins it",
+      "default": "auto",
+      "options": [
+        "auto",
+        "5m",
+        "1h"
+      ]
+    },
+    "warnSeconds": {
+      "type": "number",
+      "title": "Warn before expiry (s)",
+      "description": "Seconds left at which the band turns yellow, Keep warm appears and the first pop-up comes",
+      "default": 60
+    },
+    "compactAtTokens": {
+      "type": "number",
+      "title": "Large context (tokens)",
+      "description": "From this prompt size up, an expired cache offers Start fresh before you pay to write the whole conversation again",
+      "default": 100000
+    },
+    "toast": {
+      "type": "boolean",
+      "title": "Pop-ups near expiry",
+      "description": "Pop-ups as the cache lapses: at the warning threshold, then at 10, 3, 2 and 1 seconds (only for prompts of 20k tokens or more)",
+      "default": true
+    }
+  }
 }

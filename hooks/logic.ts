@@ -2,7 +2,7 @@
 // Keeping them here means they can be tested on their own (see logic.test.ts) and
 // register.tsx is left with only the wiring: which event calls which rule.
 
-import type { Daily, LastRequest } from '../types'
+import type { Daily } from '../types'
 
 export const FIVE_MINUTES_MS = 5 * 60 * 1000
 export const ONE_HOUR_MS = 60 * 60 * 1000
@@ -25,11 +25,6 @@ export function promptTokens(usage: Usage): number {
   return usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens
 }
 
-/** Tokens the NEXT request will send: everything this one sent, plus its answer. */
-export function contextTokens(usage: Usage): number {
-  return promptTokens(usage) + usage.output_tokens
-}
-
 // Below this size a request is too small for the cache to matter.
 const MIN_PROMPT_TOKENS = 20_000
 // "Cold" means almost nothing came from the cache. It is not exactly zero because a
@@ -47,26 +42,6 @@ export function isReingest(usage: Usage): boolean {
   }
 
   return usage.cache_read_input_tokens / sent < MAX_CACHED_SHARE_WHEN_COLD
-}
-
-/**
- * Correct the assumed cache lifetime from what a request showed.
- *
- * The server never says how long the cache lives (5 minutes or 1 hour), so we watch:
- *   - the cache was still there after a gap longer than 5 minutes -> it must be 1 hour
- *   - the cache was gone after a gap between 5 minutes and 1 hour -> it must be 5 minutes
- * Any other case proves nothing (a short gap fits both; a gap over an hour is cold
- * either way), so the current assumption is kept.
- */
-export function learnTtl(currentTtlMs: number, gapMs: number, wasReingest: boolean): number {
-  if (!wasReingest && gapMs > FIVE_MINUTES_MS) {
-    return ONE_HOUR_MS
-  }
-  if (wasReingest && gapMs > FIVE_MINUTES_MS && gapMs < ONE_HOUR_MS) {
-    return FIVE_MINUTES_MS
-  }
-
-  return currentTtlMs
 }
 
 // ---------------------------------------------------------------------------
@@ -165,62 +140,6 @@ export function formatPercent(percent: number): string {
   return percent < 10 ? `${percent.toFixed(1)}%` : `${Math.round(percent)}%`
 }
 
-/** 186432 -> "186k", 1250000 -> "1.3M", 950 -> "950". */
-export function formatTokens(tokens: number): string {
-  if (tokens >= 1_000_000) {
-    return `${(tokens / 1_000_000).toFixed(1)}M`
-  }
-  if (tokens >= 1_000) {
-    return `${Math.round(tokens / 1_000)}k`
-  }
-
-  return String(tokens)
-}
-
-/** Time left as "42m", or "<1m" for the last minute. */
-export function formatLeft(ms: number): string {
-  const minutes = Math.floor(ms / 60_000)
-
-  return minutes < 1 ? '<1m' : `${minutes}m`
-}
-
-/** Time left as "54:36" (minutes and seconds), or "1:00:00" for a full hour. */
-export function formatClock(ms: number): string {
-  const total = Math.max(0, Math.floor(ms / 1000))
-  const hours = Math.floor(total / 3600)
-  const minutes = Math.floor((total % 3600) / 60)
-  const seconds = String(total % 60).padStart(2, '0')
-
-  return hours > 0 ? `${hours}:${String(minutes).padStart(2, '0')}:${seconds}` : `${minutes}:${seconds}`
-}
-
-/** Share of the last request that came from the cache, 0 to 1; null before any request. */
-export function hitShare(last: LastRequest): number | null {
-  const read = last.readTokens ?? null
-  const fresh = last.newTokens ?? null
-  if (read === null || fresh === null || read + fresh === 0) {
-    return null
-  }
-
-  return read / (read + fresh)
-}
-
-/** A text bar of `width` cells for a share from 0 to 1: how many are filled. */
-export function barCells(share: number, width: number): { filled: number; empty: number } {
-  const filled = Math.round(Math.min(1, Math.max(0, share)) * width)
-
-  return { filled, empty: width - filled }
-}
-
-// ---------------------------------------------------------------------------
-// Starting fresh: Claude writes a handoff brief, the conversation is cleared, and the
-// brief becomes the first message of the new one.
-//
-// Writing the brief reads the whole conversation once. While the cache is warm that read
-// is cheap (cache-read price); once it is cold it costs a full re-ingest. So the best time
-// to start fresh is while the cache is still warm, which the band says in its last minutes.
-// ---------------------------------------------------------------------------
-
 /** Tokens a handoff brief is assumed to take, for the estimate. */
 export const BRIEF_TOKENS = 2_000
 /** A fresh conversation's own size (system prompt, tools, instructions) before it is learned. */
@@ -241,104 +160,9 @@ export const BRIEF_PROMPT = [
   'No preamble and no closing remarks. Under 400 words.',
 ].join(' ')
 
-/** Everything the band shows, worked out from the last request and the clock. */
-export type BandView = {
-  dot: '●' | '○'
-  tone: 'success' | 'warning' | 'error'
-  /** Share of the last request read from the cache, or null when unknown. */
-  hit: number | null
-  /** Share of the cache's lifetime left, 0 to 1: the battery's charge (0 once cold). */
-  battery: number
-  /** "54:36" while warm; null while a turn runs or once cold. */
-  timer: string | null
-  /** "411k ctx · hit 99%" */
-  stats: string
-  /** One short piece of advice: what to do now. */
-  advice: string
-  /** True in the last five minutes: the Keep warm button is worth showing. */
-  isEnding: boolean
-}
-
-/**
- * Turn the last request into the meter.
- * `percentPerMillion` is the learned rate; without it no percentages are shown.
- */
-export function describe(
-  last: LastRequest,
-  ttlMs: number,
-  now: number,
-  isWorking: boolean,
-  percentPerMillion: number | null,
-  baselineTokens: number = DEFAULT_BASELINE_TOKENS,
-): BandView {
-  const size = formatTokens(last.contextTokens)
-  const hit = hitShare(last)
-  const stats = hit === null ? `${size} ctx` : `${size} ctx · hit ${Math.round(hit * 100)}%`
-  const percentOf = (units: number) =>
-    percentPerMillion === null ? null : formatPercent((units / 1_000_000) * percentPerMillion)
-  const reingestCost = percentOf(reingestUnits(last.contextTokens, ttlMs))
-
-  // While a turn runs, every request restarts the timer, so there is no countdown.
-  if (isWorking) {
-    return { dot: '●', tone: 'success', hit, battery: 1, timer: null, stats, advice: 'in use', isEnding: false }
-  }
-
-  const left = last.at + ttlMs - now
-  if (left <= 0) {
-    return {
-      dot: '○',
-      tone: 'error',
-      hit: 0,
-      battery: 0,
-      timer: null,
-      stats: `${size} ctx`,
-      advice: `cold: next message re-reads ${size}` + (reingestCost ? ` ≈ ${reingestCost} of 5h` : ''),
-      isEnding: false,
-    }
-  }
-
-  const isEnding = left < FIVE_MINUTES_MS
-  const payoff = payoffRequests(last.contextTokens, baselineTokens, ttlMs)
-  let advice = 'warm'
-  if (isEnding) {
-    advice = reingestCost ? `going cold: ${reingestCost} of 5h at stake` : 'going cold: send now or keep warm'
-  } else if (last.contextTokens > BIG_CONTEXT_TOKENS && Number.isFinite(payoff)) {
-    advice = `big context: a fresh start pays off after ~${payoff} requests`
-  }
-
-  return {
-    dot: '●',
-    tone: isEnding ? 'warning' : 'success',
-    hit,
-    battery: batteryShare(left, ttlMs),
-    timer: formatClock(left),
-    stats,
-    advice,
-    isEnding,
-  }
-}
-
-// ---------------------------------------------------------------------------
-// The meter's extras: a draining battery, a per-request history strip, what the cache
-// saved today, and a warning when the conversation is so big a fresh start pays off fast.
-// ---------------------------------------------------------------------------
-
-/** Share of the cache's lifetime still left, 0 to 1: the battery's charge. */
-export function batteryShare(leftMs: number, ttlMs: number): number {
-  return Math.min(1, Math.max(0, leftMs / ttlMs))
-}
-
-/** How many past requests the history strip shows. */
-export const HISTORY_LENGTH = 12
-
 /** One request's colour in the history strip: mostly cached, partly, or a re-ingest. */
 export function historyTone(hit: number): 'success' | 'warning' | 'error' {
   return hit >= 0.75 ? 'success' : hit >= 0.25 ? 'warning' : 'error'
-}
-
-/** Add one request's hit share to the history, keeping the most recent ones. */
-export function addToHistory(history: readonly number[], hit: number): number[] {
-  return [...history, hit].slice(-HISTORY_LENGTH)
 }
 
 /**
@@ -367,9 +191,6 @@ export function addToDaily(daily: Daily | null, day: string, saved: number, rein
     reingests: base.reingests + (reingest > 0 ? 1 : 0),
   }
 }
-
-/** Above this size every request is expensive enough that starting fresh is worth a look. */
-export const BIG_CONTEXT_TOKENS = 300_000
 
 /**
  * After how many requests a fresh start (made now, while warm) has paid for itself: each

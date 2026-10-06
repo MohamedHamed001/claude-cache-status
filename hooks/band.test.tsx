@@ -1,118 +1,146 @@
-// Drives the real hooks the way a session does: a saved session reopens, the app draws the
-// hint line under the prompt, and the meter's buttons are pressed. Catches wiring mistakes
-// that logic.test.ts cannot see.
+// Drives the real hooks the way a session does: a model request arrives, then the app draws
+// the band and the /cache pane, and their buttons are pressed. The fake engine follows
+// prompt-cache-control's tests (MIT, see ../NOTICE.md).
 
 import { expect, test } from 'claude-code/testing'
+import type { Engine } from 'claude-code/testing'
+import type { On } from 'claude-code'
 
-const NOW = 10_000_000
-const SAVED = {
-  contextTokens: 186_000,
-  model: 'claude-opus-5-5',
-  readTokens: 184_000,
-  newTokens: 1_500,
-  ttlMs: 3_600_000,
-}
+type Calls = { ran: string[]; sent: string[]; toasts: string[] }
 
-// Where the meter draws: the hint line under the prompt in the terminal, the band above
-// the prompt on the desktop (which draws no hint line).
-const hint = (surface: 'terminal' | 'desktop') =>
-  (surface === 'terminal'
-    ? {
-        plugin: 'cache-status',
-        surface,
-        component: 'PromptHint',
-        props: { isDraft: false, isWorking: false, hint: '? for shortcuts' },
-      }
-    : {
-        plugin: 'cache-status',
-        surface,
-        component: 'AbovePrompt',
-        props: { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 140, scroll: { offset: 0, bodyRows: 10 }, view: {} },
-      }) as never
+/** The engine beneath the plugin: one main request that read 80k from the cache. */
+function fakeEngine(on: On, fork: object = { isAnswered: true, text: 'Goal: ship it.' }): Calls {
+  const calls: Calls = { ran: [], sent: [], toasts: [] }
+  on('session.usage', () => ({ value: { startedAt: 0, context: {}, rateLimits: [{ kind: 'five_hour', percentUsed: 40 }] } }) as never)
+  on('session.start', async ($, e) => ({ cwd: e.cwd }) as never)
+  on('session.cwd', () => ({ value: 'D:/repo' }) as never)
+  on('env.get', () => ({ value: undefined }))
+  on('fs.read', () => {
+    throw new Error('ENOENT')
+  })
+  on('store.get', () => ({ value: undefined }))
+  on('store.set', () => ({ value: undefined }) as never)
+  on('command.register', () => ({ value: undefined }) as never)
+  on('clock.every', () => ({ value: undefined }) as never)
+  on('ui.invalidate', () => ({ value: undefined }) as never)
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('ui.close', () => ({ value: undefined }) as never)
+  on('ui.toast', ($, e) => {
+    calls.toasts.push(String((e as { text: unknown }).text))
 
-/** A reopened session whose last request finished `minutesAgo` ago; returns what buttons did. */
-async function reopenedSession($: any, on: any, minutesAgo: number, fork: object) {
-  const ran: string[] = []
-  const sent: string[] = []
-  on('session.start', (_$: unknown, e: object) => ({ ...e, cwd: 'D:/repo' }))
-  on('session.id', () => ({ value: 's1' }))
-  on('session.usage', () => ({ value: { rateLimits: [] } }))
-  on('settings.read', () => ({ value: {} }))
-  on('clock.now', () => ({ value: NOW }))
-  on('clock.every', () => ({ value: undefined }))
-  on('store.get', (_$: unknown, e: { key: string }) => ({
-    value: e.key === 'sessions' ? { s1: { ...SAVED, at: NOW - minutesAgo * 60_000 } } : undefined,
-  }))
-  on('store.set', () => ({ value: undefined }))
-  on('model.fork', () => ({ value: fork }))
-  on('command.run', (_$: unknown, e: { command: string }) => {
-    ran.push(e.command)
+    return { value: undefined }
+  })
+  on('model.fork', () => ({ value: fork }) as never)
+  on('command.run', ($, e) => {
+    calls.ran.push(e.command)
 
     return { text: '' }
   })
-  on('prompt.submit', (_$: unknown, e: { text: string }) => {
-    sent.push(e.text)
+  on('prompt.submit', ($, e) => {
+    calls.sent.push(e.text)
 
-    return { value: { turnId: 't' } }
+    return { value: { turnId: 't' } } as never
   })
-  on('ui.toast', () => ({ value: undefined }))
-  // What the app (and other plugins) draw in both places.
-  for (const component of ['PromptHint', 'AbovePrompt'] as const) {
-    on('ui.render', { component }, ($$: any, e: any) => {
-      const { Text } = $$.ui.resolve(e)
+  on('turn.step', async function* ($, e) {
+    return {
+      turnId: e.turnId,
+      index: e.index,
+      answer: '',
+      toolUses: [],
+      stopReason: 'end_turn',
+      usage: { model: 'claude-opus-5-5', input_tokens: 300, output_tokens: 50, cache_read_input_tokens: 80_000, cache_creation_input_tokens: 1_000 },
+    } as never
+  })
+  // What the app and other plugins draw in the band: it must stay under ours.
+  on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
+    const { Text } = $.ui.resolve(e)
 
-      return <Text>ENGINE HINT</Text>
-    })
-  }
+    return <Text>OTHERS</Text>
+  })
 
-  await $.session.start({ cwd: 'D:/repo', surface: 'desktop', isInteractive: true } as never)
-
-  return { ran, sent }
+  return calls
 }
+
+async function step($: Engine) {
+  const stream = $.turn.step({ turnId: 't1', index: 0, model: 'claude-opus-5-5', messageCount: 3 } as never)
+  for (;;) {
+    const n = await stream.next()
+    if (n.done) return n.value
+  }
+}
+
+const BAND = { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 140, scroll: { offset: 0, bodyRows: 10 }, view: {} }
+const band = ($: Engine, surface: 'terminal' | 'desktop') =>
+  $.ui.mount({ plugin: 'cache-status', surface, component: 'AbovePrompt', props: BAND } as never)
+const pane = ($: Engine) =>
+  $.ui.mount({ plugin: 'cache-status', surface: 'desktop', component: 'Pane', requestId: 'cache', props: { bodyColumns: 80 } } as never)
 
 for (const surface of ['terminal', 'desktop'] as const) {
-  test(`on ${surface}, the hint line shows the meter and keeps the app's own hint`, async ($, on) => {
-    await reopenedSession($, on, 20, { isAnswered: true, text: 'brief' })
-    const ui = await $.ui.mount(hint(surface))
+  test(`on ${surface}: nothing before the first request, then the meter above what others drew`, async ($, on) => {
+    fakeEngine(on)
+    await $.session.start({ cwd: 'D:/repo', surface, isInteractive: true } as never)
+    let ui = await band($, surface)
+    expect((await ui.find({ text: /cache/ })) === undefined).toBe(true)
 
-    expect((await ui.find({ text: /40:00/ })) !== undefined).toBe(true)
-    expect((await ui.find({ text: /hit 99%/ })) !== undefined).toBe(true)
-    expect((await ui.find({ key: 'cache-start-fresh' })) !== undefined).toBe(true)
-    expect((await ui.find({ key: 'cache-keep-warm' })) === undefined).toBe(true) // not ending yet
-    expect((await ui.find({ text: /ENGINE HINT/ })) !== undefined).toBe(true)
+    await step($)
+    ui = await band($, surface)
+    expect((await ui.find({ text: /98%/ })) !== undefined).toBe(true)
+    expect((await ui.find({ text: /read 80k/ })) !== undefined).toBe(true)
+    expect((await ui.find({ text: /wrote 1k/ })) !== undefined).toBe(true)
+    expect((await ui.find({ text: /⏱/ })) !== undefined).toBe(true)
+    expect((await ui.find({ text: /warm: keep going/ })) !== undefined).toBe(true)
+    expect((await ui.find({ text: /OTHERS/ })) !== undefined).toBe(true)
   })
 }
 
-test('in the last minutes, Keep warm re-reads the cache and restarts the timer', async ($, on) => {
-  const fork = {
+// warnSeconds above the lifetime puts the cache in its last stretch at once.
+test('when it is about to lapse, Keep warm re-reads the cache', { options: { ttl: '5m', warnSeconds: 3600 } }, async ($, on) => {
+  const calls = fakeEngine(on, {
     isAnswered: true,
     text: 'ok',
-    usage: { input_tokens: 10, output_tokens: 1, cache_read_input_tokens: 186_000, cache_creation_input_tokens: 0 },
-  }
-  await reopenedSession($, on, 57, fork)
-  const ui = await $.ui.mount(hint('desktop'))
-  expect((await ui.find({ text: /3:00/ })) !== undefined).toBe(true)
+    usage: { input_tokens: 10, output_tokens: 1, cache_read_input_tokens: 81_000, cache_creation_input_tokens: 0 },
+  })
+  await $.session.start({ cwd: 'D:/repo', surface: 'desktop', isInteractive: true } as never)
+  await step($)
+  const ui = await band($, 'desktop')
+  expect((await ui.find({ text: /expires soon/ })) !== undefined).toBe(true)
 
   await ui.press({ key: 'cache-keep-warm' })
-  // The clock stands still in the test, so a restarted timer reads the full hour again.
-  expect((await ui.find({ text: /1:00:00/ })) !== undefined).toBe(true)
+  expect(calls.toasts.some(text => text.startsWith('Cache kept warm'))).toBe(true)
+})
+
+test('the /cache pane shows the table, today and the buttons', async ($, on) => {
+  fakeEngine(on)
+  await $.session.start({ cwd: 'D:/repo', surface: 'desktop', isInteractive: true } as never)
+  await step($)
+  await step($)
+  const ui = await pane($)
+  expect((await ui.find({ text: /PROMPT\u00a0CACHE/ })) !== undefined).toBe(true)
+  expect((await ui.find({ text: /History/ })) !== undefined).toBe(true)
+  expect((await ui.find({ text: /Today,\u00a0all\u00a0sessions/ })) !== undefined).toBe(true)
+  expect((await ui.find({ key: 'pane-keep-warm' })) !== undefined).toBe(true)
+  expect((await ui.find({ key: 'pane-start-fresh' })) !== undefined).toBe(true)
 })
 
 test('Start fresh writes the brief, clears, then sends the brief', async ($, on) => {
-  const { ran, sent } = await reopenedSession($, on, 20, { isAnswered: true, text: 'Goal: ship it.' })
-  const ui = await $.ui.mount(hint('desktop'))
-  await ui.press({ key: 'cache-start-fresh' })
+  const calls = fakeEngine(on)
+  await $.session.start({ cwd: 'D:/repo', surface: 'desktop', isInteractive: true } as never)
+  await step($)
+  const ui = await pane($)
+  await ui.press({ key: 'pane-start-fresh' })
 
-  expect(ran).toEqual(['clear'])
-  expect(sent.length).toBe(1)
-  expect(sent[0]).toContain('Goal: ship it.')
+  expect(calls.ran).toEqual(['clear'])
+  expect(calls.sent.length).toBe(1)
+  expect(calls.sent[0]).toContain('Goal: ship it.')
 })
 
 test('if the brief cannot be written, nothing is cleared', async ($, on) => {
-  const { ran, sent } = await reopenedSession($, on, 20, { isAnswered: false, reason: 'api-error' })
-  const ui = await $.ui.mount(hint('desktop'))
-  await ui.press({ key: 'cache-start-fresh' })
+  const calls = fakeEngine(on, { isAnswered: false, reason: 'api-error' })
+  await $.session.start({ cwd: 'D:/repo', surface: 'desktop', isInteractive: true } as never)
+  await step($)
+  const ui = await pane($)
+  await ui.press({ key: 'pane-start-fresh' })
 
-  expect(ran).toEqual([])
-  expect(sent).toEqual([])
+  expect(calls.ran).toEqual([])
+  expect(calls.sent).toEqual([])
 })

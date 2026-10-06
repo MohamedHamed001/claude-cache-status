@@ -1,233 +1,276 @@
-// Prompt-cache status for this session, as one line above the prompt.
+// cache-status: a prompt-cache meter above the prompt, and a /cache pane.
 //
-// Background: every message re-sends the whole conversation to the model. The prompt
-// cache is the server keeping the already-processed conversation for a while, so the
-// next message only pays a small "read" price. If no request arrives before the timer
-// runs out, the cache is dropped ("cold") and the next message pays full price to
-// process everything again: a re-ingest. Every request restarts the timer.
+// Built on prompt-cache-control from davila7/claude-code-templates (MIT, see ../NOTICE.md):
+// its rules (./pcc.ts, unchanged) and its band and pane design. Added here:
+//   - what a re-ingest costs in your 5-hour window, learned from your own turns
+//   - what the cache saved today, across your sessions
+//   - Keep warm: one tiny request that re-reads the cache and restarts its lifetime
+//   - Start fresh: a handoff brief, /clear, and the brief as the new first message
+//   - a history strip (one cell per request) and the big-context payoff, in the pane
 //
-// What this file does (the rules themselves are in logic.ts):
-//   each model request   -> remember when it finished and how big the context is,
-//                           and notice if it was a re-ingest
-//   every 30 seconds     -> refresh "now" so the countdown redraws
-//   end of a turn        -> save the above, report a re-ingest in a pop-up, and use
-//                           the turn to learn how much of the 5-hour window tokens cost
-//   drawing the band     -> one line: warm with time left, or cold with the cost
+// Background: every message re-sends the whole conversation. The prompt cache keeps the
+// processed part for a while (5 minutes, or 1 hour on a subscription), so the next request
+// only pays a small "read" price. If none arrives in time it lapses, and the next request
+// pays full price to write everything again: a re-ingest.
 //
-// The server never reports when the cache expires. The countdown is an estimate:
-// last request + assumed lifetime (1 hour, or 5 minutes), corrected by what requests show.
+// What happens when:
+//   each main request    -> one Sample (read / wrote / new tokens), the lifetime rules,
+//                           today's totals, and the 5h-rate bookkeeping for the turn
+//   every second         -> redraw the countdown when its text changes; countdown pop-ups
+//   end of a turn        -> learn the 5h rate from the turn; a pop-up after a re-ingest
+//   drawing              -> the band (all surfaces), and /cache
 
-import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, SessionRateLimit } from 'claude-code'
 
-import type { Daily, LastRequest } from '../types'
+import type { Daily } from '../types'
 import {
   BRIEF_PROMPT,
   DEFAULT_BASELINE_TOKENS,
-  FIVE_MINUTES_MS,
-  ONE_HOUR_MS,
   addSample,
   addToDaily,
-  addToHistory,
-  barCells,
-  contextTokens,
   costUnits,
   dayOf,
-  describe,
   formatPercent,
-  formatTokens,
-  hitShare,
+  freshStartUnits,
   historyTone,
-  isReingest,
-  learnTtl,
+  isReingest as isReingestUsage,
   learnedRate,
   median,
-  promptTokens,
+  payoffRequests,
+  reingestUnits,
   savedUnits,
 } from './logic'
-import type { Usage } from './logic'
+import {
+  COUNTDOWN_MARKS,
+  accountOf,
+  advise,
+  bar,
+  byTurn,
+  decideTtl,
+  fit,
+  fmtClock,
+  fmtTokens,
+  hitRatio,
+  isCachingDisabled,
+  lifeColor,
+  lifeRatio,
+  nextToastMark,
+  observeTtl,
+  positive,
+  promptTokens,
+  remainingMs,
+  rowRatio,
+  segments,
+  ttlMs,
+} from './pcc'
+import type { Account, Advice, CacheEnv, Sample, Ttl } from './pcc'
 
-// Every second, so the countdown shows minutes and seconds.
-const TICK_MS = 1_000
-const BAR_CELLS = 10
-// Shared by all sessions: today's saved and re-ingest totals.
-const DAILY_KEY = 'daily'
-// The smallest possible request: it re-reads the conversation from the cache, which
-// restarts the cache's timer, and answers with one word.
-const KEEP_WARM_PROMPT = 'Reply with the single word: ok.'
-// Shared by all sessions: sizes of conversations' first requests, to estimate a fresh start.
-const BASELINE_KEY = 'baseline'
-// A first request bigger than this is a reopened old conversation, not a fresh one.
+const PANE = 'cache'
+const COMMAND = 'cache'
+const KEEP = 200
+// Below this a lapsing cache costs too little to interrupt anyone about.
+const TOAST_MIN_TOKENS = 20_000
+const HISTORY_CELLS = 24
+// Shared by all sessions on this machine.
+const CALIBRATION_KEY = 'calibration' // per model: recent "percent of 5h per million cost units"
+const BASELINE_KEY = 'baseline' // sizes of conversations' first requests
+const DAILY_KEY = 'daily' // today's saved and re-ingest totals
 const MAX_BASELINE_SAMPLE = 100_000
-// Saved records older than this are dropped from the store.
-const KEEP_SAVED_MS = 3 * 24 * 60 * 60 * 1000
-const STORE_KEY = 'sessions'
-// Shared by all sessions: per model, the recent "percent per million cost units" samples.
-const CALIBRATION_KEY = 'calibration'
-type Calibration = Record<string, readonly number[]>
+// The smallest possible request: it re-reads the conversation from the cache, which
+// restarts the cache's lifetime, and answers with one word.
+const KEEP_WARM_PROMPT = 'Reply with the single word: ok.'
 
-// What is saved per session so a reopened session still knows its last request.
-// `model` is optional because records saved by the first version of this mod lack it.
-type Saved = Omit<LastRequest, 'model'> & { ttlMs: number; model?: string }
-
-// An atom is a named value the app stores for this mod. Writing to one makes the app
-// redraw whatever read it, which is how the band updates by itself.
-const last = atom({ plugin: 'cache-status', key: 'last' } as const, null)
-const ttlMs = atom({ plugin: 'cache-status', key: 'ttlMs' } as const, ONE_HOUR_MS)
-const now = atom({ plugin: 'cache-status', key: 'now' } as const, 0)
-const percentPerMillion = atom({ plugin: 'cache-status', key: 'percentPerMillion' } as const, null)
-const baselineTokens = atom({ plugin: 'cache-status', key: 'baselineTokens' } as const, DEFAULT_BASELINE_TOKENS)
-const fresh = atom({ plugin: 'cache-status', key: 'fresh' } as const, 'idle')
-const history = atom({ plugin: 'cache-status', key: 'history' } as const, [])
-const daily = atom({ plugin: 'cache-status', key: 'daily' } as const, null)
-const warming = atom({ plugin: 'cache-status', key: 'warming' } as const, false)
-
-// Plain variables for the turn in progress. They are not drawn, and losing them on a
-// reload only costs one pop-up.
-let fiveHourPercent: number | null = null // latest known use of the 5-hour window
+// ---- State. Plain module variables, as in prompt-cache-control: a change calls
+// $.ui.invalidate('ui.render') so the band and pane redraw.
+let samples: Sample[] = []
+let ttl: Ttl = '5m'
+let baseTtl: Ttl = '5m'
+let pinned = false
+let observed: Ttl | undefined
+let setting: unknown
+let account: Account = 'other'
+let ttlSource = 'default'
+let envSource = 'default'
+let env: CacheEnv = {}
+let timer: { cancel: () => void } | undefined
+let lastKey = ''
+let toastedFor = 0
+let toastLevel = Infinity
+let isPaneOpen = false
+// Ours: the 5h estimate, today's totals, and the two buttons' progress.
+let rate: number | null = null // percent of the 5h window per million cost units
+let rateModel = ''
+let baseline = DEFAULT_BASELINE_TOKENS
+let daily: Daily | null = null
+let freshState: 'idle' | 'writing' | 'clearing' = 'idle'
+let isWarming = false
+// The turn in progress, for learning the 5h rate. A turn with a subagent or two models
+// mixes price levels, so it is not used as a sample.
+let fiveHourPercent: number | null = null
 let percentAtTurnStart: number | null = null
-let reingestedTokens = 0 // above 0 when a request in this turn was a re-ingest
-let turnUnits = 0 // what this turn has cost so far, in cost units
-let turnModel: string | null = null // the model answering this turn
-// A turn that used a subagent or two models mixes price levels, so it cannot teach
-// us the rate for one model. Such turns are not used as samples.
+let turnUnits = 0
+let turnModel: string | null = null
 let isTurnMixed = false
+let reingestedTokens = 0
 
-/** Keep the latest 5-hour window figure, and treat a used-up window as overage. */
-async function rememberLimits($: EngineInterface, limits: readonly SessionRateLimit[]) {
-  fiveHourPercent = limits.find(limit => limit.kind === 'five_hour')?.percentUsed ?? null
-  // Past a usage limit the cache lifetime drops from 1 hour to 5 minutes.
-  if (limits.some(limit => limit.percentUsed >= 100)) {
-    await update($, ttlMs, () => FIVE_MINUTES_MS)
-  }
+type Policy = { warnMs: number; compactAtTokens: number }
+
+function current(policy: Policy, now: number) {
+  const last = samples[samples.length - 1]
+  const prev = samples[samples.length - 2]
+  const disabled = last ? isCachingDisabled(last.model, env) : isCachingDisabled('', env)
+  const advice: Advice = advise(last, prev, { ttl, ...policy }, now, disabled)
+  const left = last ? remainingMs(last, ttl, now) : 0
+
+  return { last, advice, left }
 }
 
-/** Load the learned rate for a model from the shared store into this session. */
+const COLOR: Record<Advice['kind'], string | undefined> = {
+  warm: 'green',
+  soon: 'yellow',
+  expired: 'red',
+  miss: 'red',
+  off: undefined,
+  cold: undefined,
+  uncached: undefined,
+}
+
+/** A share of the 5h window for some cost units, or null until the rate is learned. */
+function percentOf(units: number): string | null {
+  return rate === null ? null : formatPercent((units / 1_000_000) * rate)
+}
+
+/** A sample's token counts in the shape logic.ts takes. */
+const usageOf = (s: Sample) => ({
+  input_tokens: s.fresh,
+  output_tokens: s.output,
+  cache_read_input_tokens: s.read,
+  cache_creation_input_tokens: s.write,
+})
+
+/** A request is a re-ingest when it is large and almost nothing came from the cache. */
+const isReingest = (s: Sample) => isReingestUsage(usageOf(s))
+
+// The promptCacheTtl setting, from the settings files that can carry it (local over
+// project over user). From prompt-cache-control.
+async function readSetting($: EngineInterface): Promise<unknown> {
+  const home = (await $.env.get('HOME').catch(() => undefined)) ?? (await $.env.get('USERPROFILE').catch(() => undefined))
+  const cwd = await $.session.cwd().catch(() => undefined)
+  const files = [cwd && `${cwd}/.claude/settings.local.json`, cwd && `${cwd}/.claude/settings.json`, home && `${home}/.claude/settings.json`]
+  for (const file of files) {
+    if (!file) continue
+    try {
+      const value = JSON.parse(String(await $.fs.read(file))).promptCacheTtl
+      if (value === '5m' || value === '1h') return value
+    } catch {
+      // missing or unreadable: the next file
+    }
+  }
+
+  return undefined
+}
+
+/** Load the learned 5h rate for a model from the shared store. */
 async function loadRate($: EngineInterface, model: string) {
-  const all = ((await $.store.get(CALIBRATION_KEY)) ?? {}) as Calibration
-  const rate = learnedRate(all[model] ?? [])
-  await update($, percentPerMillion, () => rate)
-}
-
-/** Called after every model request of the main conversation. */
-async function recordRequest($: EngineInterface, usage: Usage & { model: string }) {
-  const finishedAt = await $.clock.now()
-  const previous = await read($, last)
-
-  if (turnModel !== null && turnModel !== usage.model) {
-    isTurnMixed = true
-  }
-  turnModel = usage.model
-  turnUnits += costUnits(usage, await read($, ttlMs))
-  // First request on this model in this session: fetch what is already known about it.
-  if (previous?.model !== usage.model) {
-    await loadRate($, usage.model)
-  }
-
-  // With a previous request to compare against, this one tells us two things:
-  // whether the cache had gone cold, and (from the gap) how long it really lives.
-  if (previous) {
-    const wasReingest = isReingest(usage)
-    const assumed = await read($, ttlMs)
-    const learned = learnTtl(assumed, finishedAt - previous.at, wasReingest)
-    if (learned !== assumed) {
-      await update($, ttlMs, () => learned)
-    }
-    if (wasReingest) {
-      reingestedTokens = promptTokens(usage)
-    }
-  } else {
-    await learnBaseline($, contextTokens(usage))
-  }
-
-  await rememberRequest($, usage, finishedAt, previous !== null && isReingest(usage))
+  const all = ((await $.store.get(CALIBRATION_KEY)) ?? {}) as Record<string, readonly number[]>
+  rate = learnedRate(all[model] ?? [])
+  rateModel = model
 }
 
 /**
- * Note one request that read the conversation (a turn's request or a Keep warm): it
- * restarted the cache timer, adds a cell to the history strip, and counts towards today.
+ * Record one request that read the conversation (a turn's request or a Keep warm): the
+ * lifetime rules, today's totals, and the first request's size as a fresh-start baseline.
  */
-async function rememberRequest($: EngineInterface, usage: Usage & { model: string }, at: number, wasReingest: boolean) {
-  const record: LastRequest = {
-    at,
-    contextTokens: contextTokens(usage),
-    model: usage.model,
-    readTokens: usage.cache_read_input_tokens,
-    newTokens: usage.input_tokens + usage.cache_creation_input_tokens,
+async function recordSample($: EngineInterface, sample: Sample, options: Record<string, unknown>) {
+  const isFirst = samples.length === 0
+  samples.push(sample)
+  if (samples.length > KEEP) samples = samples.slice(-KEEP)
+
+  if (!pinned) {
+    // The account can change under a session: a subscription running out of plan usage
+    // moves to usage credits. From prompt-cache-control.
+    account = accountOf((await $.session.usage().catch(() => undefined))?.rateLimits ?? [])
+    const choice = decideTtl(options.ttl, env, setting, account)
+    baseTtl = choice.ttl
+    envSource = choice.source
+    if (observed === undefined) {
+      ttl = baseTtl
+      ttlSource = envSource
+    }
+    const seen = observeTtl(samples[samples.length - 2], sample, observed)
+    if (seen !== observed) {
+      observed = seen
+      ttl = seen ?? baseTtl
+      ttlSource = `observed from request timing; ${envSource} said ${baseTtl}`
+    }
   }
-  await update($, last, () => record)
-  await update($, now, () => at)
-  await update($, history, list => addToHistory(list, hitShare(record) ?? 0))
+
+  if (sample.model !== rateModel) {
+    await loadRate($, sample.model).catch(() => undefined)
+  }
+  if (isFirst && promptTokens(sample) <= MAX_BASELINE_SAMPLE) {
+    const sizes = [...(((await $.store.get(BASELINE_KEY)) ?? []) as number[]), promptTokens(sample)].slice(-20)
+    await $.store.set(BASELINE_KEY, sizes)
+    baseline = median(sizes)
+  }
 
   // Today's totals live in the shared store: other sessions add to them too.
-  const reingest = wasReingest ? costUnits(usage, await read($, ttlMs)) : 0
-  const updated = addToDaily(((await $.store.get(DAILY_KEY)) ?? null) as Daily | null, dayOf(at), savedUnits(usage), reingest)
-  await $.store.set(DAILY_KEY, updated)
-  await update($, daily, () => updated)
+  const reingest = !isFirst && isReingest(sample) ? costUnits(usageOf(sample), ttlMs(ttl)) : 0
+  const stored = ((await $.store.get(DAILY_KEY)) ?? null) as Daily | null
+  daily = addToDaily(stored, dayOf(sample.startedAt), savedUnits(usageOf(sample)), reingest)
+  await $.store.set(DAILY_KEY, daily)
+
+  lastKey = ''
+  $.ui.invalidate('ui.render')
 }
 
 /**
- * "Keep warm": one tiny request over the conversation. Reading it from the cache restarts
- * the cache's timer (cache hits refresh its lifetime), for about a tenth of the
+ * Keep warm: one tiny request over the conversation. Reading it from the cache restarts
+ * the cache's lifetime (a cache hit refreshes the entry), for about a tenth of the
  * conversation's size instead of a full re-ingest later.
  */
-async function keepWarm($: EngineInterface) {
-  if (await read($, warming)) {
-    return
-  }
-  await update($, warming, () => true)
+async function keepWarm($: EngineInterface, options: Record<string, unknown>) {
+  const last = samples[samples.length - 1]
+  if (isWarming || !last) return
+  isWarming = true
+  $.ui.invalidate('ui.render')
   try {
+    const startedAt = Date.now()
     const reply = await $.model.fork({ prompt: KEEP_WARM_PROMPT })
     if (!reply.isAnswered || !reply.usage) {
       $.ui.toast(`Keep warm failed (${reply.isAnswered ? 'no usage' : reply.reason}).`)
       return
     }
-    const previous = await read($, last)
-    const usage = { ...reply.usage, model: previous?.model ?? '' }
-    await rememberRequest($, usage, await $.clock.now(), isReingest(usage))
-    const rate = await read($, percentPerMillion)
-    const cost = rate === null ? '' : ` for ≈ ${formatPercent((costUnits(usage, await read($, ttlMs)) / 1_000_000) * rate)}`
-    $.ui.toast(isReingest(usage) ? 'The cache had already gone cold: it was re-read.' : `Cache kept warm${cost}.`)
+    const sample: Sample = {
+      turnId: `keep-warm-${startedAt}`,
+      index: 0,
+      model: last.model,
+      startedAt,
+      read: reply.usage.cache_read_input_tokens,
+      write: reply.usage.cache_creation_input_tokens,
+      fresh: reply.usage.input_tokens,
+      output: reply.usage.output_tokens,
+    }
+    await recordSample($, sample, options)
+    const cost = percentOf(costUnits(usageOf(sample), ttlMs(ttl)))
+    $.ui.toast(isReingest(sample) ? 'The cache had already lapsed: it was written again.' : `Cache kept warm${cost ? ` for ≈ ${cost} of 5h` : ''}.`)
   } catch (error) {
     $.ui.toast(`Keep warm failed: ${error instanceof Error ? error.message : String(error)}`)
   } finally {
-    await update($, warming, () => false)
+    isWarming = false
+    $.ui.invalidate('ui.render')
   }
 }
 
 /**
- * A conversation's first request shows how big a fresh start is (system prompt, tools,
- * instructions). Keep the last 20 such sizes, shared by all sessions; use their median.
- */
-async function learnBaseline($: EngineInterface, tokens: number) {
-  if (tokens > MAX_BASELINE_SAMPLE) {
-    return
-  }
-  const samples = [...(((await $.store.get(BASELINE_KEY)) ?? []) as number[]), tokens].slice(-20)
-  await $.store.set(BASELINE_KEY, samples)
-  await update($, baselineTokens, () => median(samples))
-}
-
-/** A new conversation (after /clear) starts with no cache and no turn in progress. */
-async function forgetConversation($: EngineInterface) {
-  await update($, last, () => null)
-  await update($, history, () => [])
-  reingestedTokens = 0
-  turnUnits = 0
-  turnModel = null
-  isTurnMixed = false
-}
-
-/**
- * "Start fresh": Claude writes a handoff brief, the conversation is cleared, and the brief
- * is sent as the new conversation's first message. If the brief cannot be written, nothing
- * is cleared.
+ * Start fresh: Claude writes a handoff brief, the conversation is cleared, and the brief
+ * is sent as the new conversation's first message. If the brief cannot be written,
+ * nothing is cleared.
  */
 async function startFresh($: EngineInterface) {
-  if ((await read($, fresh)) !== 'idle') {
-    return
-  }
-  await update($, fresh, () => 'writing')
+  if (freshState !== 'idle') return
+  freshState = 'writing'
+  $.ui.invalidate('ui.render')
   try {
     // Reads the conversation through the cache: cheap while it is warm.
     const reply = await $.model.fork({ prompt: BRIEF_PROMPT })
@@ -235,9 +278,9 @@ async function startFresh($: EngineInterface) {
       $.ui.toast(`Could not write the handoff brief (${reply.reason}). Nothing was cleared.`)
       return
     }
-    await update($, fresh, () => 'clearing')
+    freshState = 'clearing'
+    $.ui.invalidate('ui.render')
     await $.command.run({ command: 'clear' })
-    await forgetConversation($)
     // Not awaited: it is queued and starts once the cleared session is idle.
     void $.prompt
       .submit({
@@ -249,288 +292,456 @@ async function startFresh($: EngineInterface) {
   } catch (error) {
     $.ui.toast(`Start fresh failed: ${error instanceof Error ? error.message : String(error)}`)
   } finally {
-    await update($, fresh, () => 'idle')
+    freshState = 'idle'
+    $.ui.invalidate('ui.render')
   }
 }
 
-/** Save this session's record so it survives the app closing. */
-async function save($: EngineInterface) {
-  const record = await read($, last)
-  if (!record) {
-    return
-  }
-
-  const id = await $.session.id()
-  const all = ((await $.store.get(STORE_KEY)) ?? {}) as Record<string, Saved>
-  all[id] = { ...record, ttlMs: await read($, ttlMs) }
-
-  // Drop records of sessions not used for a few days, so the store does not grow forever.
-  const cutoff = record.at - KEEP_SAVED_MS
-  for (const [sessionId, saved] of Object.entries(all)) {
-    if (saved.at < cutoff) delete all[sessionId]
-  }
-  await $.store.set(STORE_KEY, all)
+/** Keep the latest 5-hour window figure. */
+function rememberLimits(limits: readonly SessionRateLimit[]) {
+  fiveHourPercent = limits.find(limit => limit.kind === 'five_hour')?.percentUsed ?? null
 }
 
-/** Use a finished turn as one more sample of "how much window does a cost unit use". */
-async function learnFromTurn($: EngineInterface, before: number | null, after: number | null) {
-  if (isTurnMixed || turnModel === null) {
-    return
-  }
-
-  const all = ((await $.store.get(CALIBRATION_KEY)) ?? {}) as Calibration
-  const samples = all[turnModel] ?? []
-  const updated = addSample(samples, turnUnits, before, after)
-  if (updated === samples) {
-    return // the turn was too small, or the window reset during it
-  }
-
-  await $.store.set(CALIBRATION_KEY, { ...all, [turnModel]: updated })
-  const rate = learnedRate(updated)
-  await update($, percentPerMillion, () => rate)
-}
-
-/** Called when a turn of the main conversation ends. */
+/** End of a main turn: learn the 5h rate from it, and report a re-ingest. */
 async function finishTurn($: EngineInterface) {
-  await save($)
-
   const before = percentAtTurnStart
-  await rememberLimits($, (await $.session.usage()).rateLimits)
+  rememberLimits((await $.session.usage()).rateLimits)
   const after = fiveHourPercent
-  await learnFromTurn($, before, after)
 
-  if (reingestedTokens === 0) {
-    return
+  if (!isTurnMixed && turnModel !== null) {
+    const all = ((await $.store.get(CALIBRATION_KEY)) ?? {}) as Record<string, readonly number[]>
+    const known = all[turnModel] ?? []
+    const updated = addSample(known, turnUnits, before, after)
+    if (updated !== known) {
+      await $.store.set(CALIBRATION_KEY, { ...all, [turnModel]: updated })
+      rate = learnedRate(updated)
+    }
   }
 
-  const tokens = formatTokens(reingestedTokens)
-
-  // The window figures cover the whole turn, not only the re-ingest, so say "this turn".
-  $.ui.toast(
-    before !== null && after !== null
-      ? `Cache was cold: re-ingested ${tokens} tokens. 5h window ${before}% → ${after}% this turn.`
-      : `Cache was cold: re-ingested ${tokens} tokens.`,
-  )
+  if (reingestedTokens > 0) {
+    const tokens = fmtTokens(reingestedTokens)
+    $.ui.toast(
+      before !== null && after !== null
+        ? `Cache was cold: re-wrote ${tokens} tokens. 5h window ${before}% → ${after}% this turn.`
+        : `Cache was cold: re-wrote ${tokens} tokens.`,
+    )
+  }
 }
 
-export const register: Register = on => {
+/** A /clear starts a new conversation: its cache is a new one. */
+function forgetConversation() {
+  samples = []
+  lastKey = ''
+  toastedFor = 0
+  observed = undefined
+  ttl = baseTtl
+  ttlSource = envSource
+}
+
+export const register: Register = (on, options) => {
+  const policy: Policy = {
+    warnMs: positive(options.warnSeconds, 60) * 1000,
+    compactAtTokens: positive(options.compactAtTokens, 100_000),
+  }
+  const wantToast = options.toast !== false
+
   on('session.start', async ($, e, next) => {
-    // Nothing here may stop the session from starting, so every step is optional.
+    const r = await next(e)
+    forgetConversation()
+    const none = () => undefined
+    env = {
+      enable1h: await $.env.get('ENABLE_PROMPT_CACHING_1H').catch(none),
+      force5m: await $.env.get('FORCE_PROMPT_CACHING_5M').catch(none),
+      ttlVar: await $.env.get('CLAUDE_CODE_PROMPT_CACHE_TTL').catch(none),
+      disableAll: await $.env.get('DISABLE_PROMPT_CACHING').catch(none),
+      disableHaiku: await $.env.get('DISABLE_PROMPT_CACHING_HAIKU').catch(none),
+      disableSonnet: await $.env.get('DISABLE_PROMPT_CACHING_SONNET').catch(none),
+      disableOpus: await $.env.get('DISABLE_PROMPT_CACHING_OPUS').catch(none),
+    }
+    pinned = options.ttl === '5m' || options.ttl === '1h'
+    setting = await readSetting($)
+    const usage = await $.session.usage().catch(() => undefined)
+    account = accountOf(usage?.rateLimits ?? [])
+    rememberLimits(usage?.rateLimits ?? [])
+    const choice = decideTtl(options.ttl, env, setting, account)
+    baseTtl = choice.ttl
+    ttl = baseTtl
+    envSource = choice.source
+    ttlSource = envSource
+
     try {
-      const saved = ((await $.store.get(STORE_KEY)) ?? {}) as Record<string, Saved>
-      const mine = saved[await $.session.id()]
-      if (mine) {
-        // A record without a model gets '', which simply finds no learned rate.
-        const model = mine.model ?? ''
-        await update($, last, () => ({ ...mine, model }))
-        await update($, ttlMs, () => mine.ttlMs)
-        await loadRate($, model)
-      }
-
-      // If you set the lifetime yourself in settings.json, that is not a guess.
-      const settings = (await $.settings.read()) as { promptCacheTtl?: '5m' | '1h' }
-      if (settings.promptCacheTtl) {
-        const configured = settings.promptCacheTtl === '5m' ? FIVE_MINUTES_MS : ONE_HOUR_MS
-        await update($, ttlMs, () => configured)
-      }
-
-      await rememberLimits($, (await $.session.usage()).rateLimits)
-
-      const baseline = ((await $.store.get(BASELINE_KEY)) ?? []) as number[]
-      if (baseline.length > 0) {
-        await update($, baselineTokens, () => median(baseline))
-      }
-
-      const savedDaily = ((await $.store.get(DAILY_KEY)) ?? null) as Daily | null
-      const today = dayOf(await $.clock.now())
-      await update($, daily, () => (savedDaily && savedDaily.day === today ? savedDaily : null))
+      const sizes = ((await $.store.get(BASELINE_KEY)) ?? []) as number[]
+      if (sizes.length > 0) baseline = median(sizes)
+      const stored = ((await $.store.get(DAILY_KEY)) ?? null) as Daily | null
+      daily = stored && stored.day === dayOf(Date.now()) ? stored : null
     } catch {
-      // Start with what we have; the first request fills in the rest.
+      // The meter works without them.
     }
 
-    const tick = async () => {
-      const time = await $.clock.now()
-      await update($, now, () => time)
-    }
-    void tick()
-    $.clock.every(TICK_MS, () => void tick())
+    await $.command
+      .register({ name: COMMAND, description: 'Prompt cache: time left, per-turn table, Keep warm and Start fresh', argumentHint: '[stop]', immediate: true })
+      .catch(() => undefined)
 
-    return next(e)
+    timer?.cancel()
+    timer = $.clock.every(1000, () => {
+      const now = Date.now()
+      const { last, advice, left } = current(policy, now)
+      const key = `${advice.kind}|${advice.text}|${left > 0 ? fmtClock(left) : ''}`
+      if (key !== lastKey) {
+        lastKey = key
+        $.ui.invalidate('ui.render')
+      }
+      if (wantToast && last && left > 0 && promptTokens(last) >= TOAST_MIN_TOKENS) {
+        if (toastedFor !== last.startedAt) {
+          toastedFor = last.startedAt
+          toastLevel = Infinity
+        }
+        // The first pop-up at warnSeconds, then at 10, 3, 2 and 1 seconds; a late tick
+        // skips to the newest one. From prompt-cache-control.
+        const secs = Math.ceil(left / 1000)
+        const mark = nextToastMark(secs, policy.warnMs / 1000, toastLevel)
+        if (mark !== undefined) {
+          toastLevel = mark
+          const stake = percentOf(reingestUnits(promptTokens(last), ttlMs(ttl)))
+          const tail =
+            secs <= COUNTDOWN_MARKS[0]
+              ? 'send a message now'
+              : `send a message or Keep warm to keep ${fmtTokens(promptTokens(last))} tokens warm${stake ? ` (${stake} of 5h at stake)` : ''}`
+          $.ui.toast(`cache expires in ${secs >= 60 ? fmtClock(left) : `${secs}s`}: ${tail}`)
+        }
+      }
+    })
+
+    return r
   })
 
-  // A /clear ends the conversation (no session.start follows): its cache is gone with it.
   on('session.end', async ($, e, next) => {
     if (e.reason === 'clear') {
-      await forgetConversation($).catch(() => undefined)
+      forgetConversation()
+      $.ui.invalidate('ui.render')
+
+      return next(e)
     }
+    timer?.cancel()
+    timer = undefined
 
     return next(e)
   })
 
-  // The app raises this when a usage figure moves; we only keep the latest numbers.
   on('session.measure', async ($, e, next) => {
-    try {
-      await rememberLimits($, e.rateLimits)
-    } catch {
-      // Keeping a number up to date is never worth breaking the event for.
-    }
+    rememberLimits(e.rateLimits)
 
     return next(e)
   })
 
   on('turn.start', ($, e, next) => {
     percentAtTurnStart = fiveHourPercent
-    reingestedTokens = 0
     turnUnits = 0
     turnModel = null
     isTurnMixed = false
+    reingestedTokens = 0
 
     return next(e)
   })
 
-  // One model request. This event streams the answer piece by piece, so its hook is a
-  // generator: `yield* next(e)` passes every piece through untouched and gives back
-  // the final result, which carries the request's token counts.
+  // Each main-loop request: what the cache did with it. Subagents have their own
+  // prefixes and are left out (but they make the turn useless as a 5h sample).
   on('turn.step', async function* ($, e, next) {
-    const result = yield* next(e)
-
-    // Subagents have their own conversation and their own cache; skip them, but
-    // note that this turn used one (see isTurnMixed).
     if (e.agentId) {
       isTurnMixed = true
+
+      return yield* next(e)
     }
-    if (!e.agentId && result.usage) {
+    const startedAt = Date.now()
+    const r = yield* next(e)
+    if (r.usage) {
       try {
-        await recordRequest($, result.usage)
+        const sample: Sample = {
+          turnId: e.turnId,
+          index: e.index,
+          model: r.usage.model || e.model,
+          startedAt,
+          read: r.usage.cache_read_input_tokens,
+          write: r.usage.cache_creation_input_tokens,
+          fresh: r.usage.input_tokens,
+          output: r.usage.output_tokens,
+        }
+        if (turnModel !== null && turnModel !== sample.model) isTurnMixed = true
+        turnModel = sample.model
+        turnUnits += costUnits(usageOf(sample), ttlMs(ttl))
+        if (samples.length > 0 && isReingest(sample)) reingestedTokens = promptTokens(sample)
+        await recordSample($, sample, options)
       } catch {
         // Never let bookkeeping break a model request.
       }
     }
 
-    return result
+    return r
   })
 
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
-
     if (!e.agentId) {
-      try {
-        await finishTurn($)
-      } catch {
-        // Same rule: a failed save or pop-up must not affect the turn.
-      }
+      await finishTurn($).catch(() => undefined)
     }
 
     return result
   })
 
-  // Where the meter draws: the terminal has a hint line under the prompt, apart from the
-  // bands above it; the desktop app draws no hint line, so there the meter is its own card
-  // in the band above the prompt.
-  on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
-    const engineHint = await next(e)
-    if (e.surface !== 'terminal') {
-      return engineHint
-    }
-    const meter = await drawMeter($, e, e.props.isWorking)
-    if (!meter) {
-      return engineHint
-    }
-    const { Box } = $.ui.resolve(e)
+  on('command.run', { command: COMMAND }, async ($, e) => {
+    if (e.args.trim().toLowerCase() === 'stop') {
+      await $.ui.close({ id: PANE }).catch(() => undefined)
+      isPaneOpen = false
 
-    return (
-      <Box columnGap={1} alignItems="center">
-        {meter}
-        {engineHint}
-      </Box>
-    )
+      return { text: 'Cache pane closed.' }
+    }
+    isPaneOpen = true
+    await $.ui.open({ id: PANE, title: 'Cache', focus: true })
+    $.ui.invalidate('ui.render')
+    const { advice } = current(policy, Date.now())
+
+    return { text: `${ttl} cache (${ttlSource}) · ${advice.text}` }
   })
 
+  on('ui.close', async ($, e, next) => {
+    if (e.id === PANE) isPaneOpen = false
+
+    return next(e)
+  })
+
+  // ---- The band: one row in the prompt-cache-control style, with our extras.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    // Other mods draw here too: ask for theirs first and keep it under our row.
     const beneath = await next(e)
-    if (e.surface === 'terminal' || e.props.hasSurvey) {
-      return beneath
+    if (e.props.hasSurvey || isPaneOpen) return beneath
+    const now = Date.now()
+    const { last, advice, left } = current(policy, now)
+    if (!last && advice.kind !== 'off') return beneath
+    const { Box, Button, Text } = $.ui.resolve(e)
+    const columns = e.props.bodyColumns ?? 100
+    const color = COLOR[advice.kind]
+
+    if (!last) {
+      return (
+        <Box flexDirection="column" rowGap={1}>
+          <Text dimColor>{fit(`cache: ${advice.text}`, columns)}</Text>
+          {beneath}
+        </Box>
+      )
     }
-    const meter = await drawMeter($, e, e.props.isWorking)
-    if (!meter) {
-      return beneath
+
+    const ratio = hitRatio(last)
+    const wide = columns >= 110
+    const size = promptTokens(last)
+    const isIdle = freshState === 'idle' && !isWarming && !e.props.isWorking
+    const icon = advice.kind === 'warm' ? '●' : advice.kind === 'soon' ? '▲' : advice.kind === 'expired' || advice.kind === 'miss' ? '✖' : '○'
+
+    // Our addition to the advice: what is at stake, or what was saved.
+    let extra = ''
+    const stake = percentOf(reingestUnits(size, ttlMs(ttl)))
+    if (advice.kind === 'soon' && stake) extra = ` · ${stake} of 5h at stake`
+    else if (advice.kind === 'expired' && stake) extra = ` · ≈ ${stake} of 5h`
+    else if (advice.kind === 'warm' && wide && daily && daily.savedUnits > 0) {
+      const saved = percentOf(daily.savedUnits)
+      extra = saved ? ` · saved ≈ ${saved} of 5h today` : ` · saved ${fmtTokens(Math.round(daily.savedUnits))} today`
     }
-    const { Box } = $.ui.resolve(e)
+    const status = freshState === 'writing' ? 'writing handoff brief…' : freshState === 'clearing' ? 'clearing…' : isWarming ? 'keeping warm…' : advice.text + extra
 
     return (
       <Box flexDirection="column" rowGap={1}>
-        {/* Its own filled card, one per plugin, so stacked bands read as separate. */}
-        <Box columnGap={1} alignItems="center" backgroundColor="userMessageBackground" paddingX={1}>
-          {meter}
+        <Box flexDirection="row" columnGap={1} alignItems="center">
+          <Text bold color={color}>{icon}</Text>
+          <Text bold color="cyan">cache</Text>
+          <Text color={color}>{bar(ratio, wide ? 10 : 6)}</Text>
+          <Text bold>{`${Math.round(ratio * 100)}%`}</Text>
+          {wide ? (
+            <>
+              <Text color="green">{`read ${fmtTokens(last.read)}`}</Text>
+              <Text color="yellow">{`wrote ${fmtTokens(last.write)}`}</Text>
+              <Text color="cyan">{`new ${fmtTokens(last.fresh)}`}</Text>
+            </>
+          ) : (
+            <Text dimColor>{`${fmtTokens(size)} tok`}</Text>
+          )}
+          {advice.kind !== 'uncached' && advice.kind !== 'off' && (
+            <Text bold color={left > 0 ? lifeColor(left, ttl, policy.warnMs) : 'red'}>{left > 0 ? `⏱ ${fmtClock(left)}` : '⏱ 0:00'}</Text>
+          )}
+          <Box flexGrow={1} flexShrink={1} minWidth={0} overflow="hidden">
+            <Text dimColor wrap="truncate-end">{`${ttl} · ${status}`}</Text>
+          </Box>
+          {isIdle && advice.kind === 'soon' && <Button key="cache-keep-warm" label="Keep warm" onPress={() => keepWarm($, options)} />}
+          {isIdle && advice.kind === 'expired' && size >= policy.compactAtTokens && (
+            <Button key="cache-start-fresh" label="Start fresh" onPress={() => startFresh($)} />
+          )}
         </Box>
         {beneath}
       </Box>
     )
   })
+
+  // ---- The pane: prompt-cache-control's layout, then history, today and the buttons.
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const width = Math.max(30, (e.props.bodyColumns ?? 60) - 1)
+    // HTML collapses runs of spaces and trims a text's ends; a no-break space keeps them.
+    const sp = (t: string) => (e.surface === 'terminal' ? t : t.replace(/ /g, ' '))
+    const now = Date.now()
+    const { last, advice, left } = current(policy, now)
+    const all = byTurn(samples)
+    const counting = !!last && advice.kind !== 'uncached' && advice.kind !== 'off'
+    const clockColor = counting ? lifeColor(left, ttl, policy.warnMs) : undefined
+    const stateColor = advice.kind === 'expired' || advice.kind === 'miss' ? 'red' : (clockColor ?? COLOR[advice.kind])
+    const hitColor = (pct: number) => (pct >= 80 ? 'green' : pct >= 40 ? 'yellow' : 'red')
+    // Solid bars are filled Boxes, not block characters, so HTML draws no seams.
+    const solid = (key: string, parts: [number, string | undefined][]) => (
+      <Box key={key} flexDirection="row" height={1} flexShrink={0}>
+        {parts.map(([w, c], i) => (w > 0 ? <Box key={`${key}:${i}`} width={w} height={1} flexShrink={0} backgroundColor={c} /> : null))}
+      </Box>
+    )
+    const cell = (key: string, w: number, text: string, c?: string, bold = false) => (
+      <Box key={key} width={w} flexShrink={0} justifyContent="flex-end">
+        <Text color={c} bold={bold} dimColor={!c}>{sp(text)}</Text>
+      </Box>
+    )
+
+    const barW = Math.min(width, 40)
+    const life = lifeRatio(left, ttl)
+    const lifeFilled = Math.round(life * barW)
+    const [sr, sw, sn] = last ? segments(last.read, last.write, last.fresh, barW) : [0, 0, 0]
+    const rows = all.slice(-Math.max(3, (e.viewport?.rows ?? 24) - 24))
+    const icon = advice.kind === 'warm' ? '●' : advice.kind === 'soon' ? '▲' : advice.kind === 'expired' || advice.kind === 'miss' ? '✖' : '○'
+    const strip = samples.slice(-HISTORY_CELLS)
+    const size = last ? promptTokens(last) : 0
+    const payoff = last ? payoffRequests(size, baseline, ttlMs(ttl)) : Infinity
+    const isIdle = freshState === 'idle' && !isWarming
+    const saved = daily && daily.savedUnits > 0 ? percentOf(daily.savedUnits) : null
+    const lost = daily && daily.reingestUnits > 0 ? percentOf(daily.reingestUnits) : null
+    const reingestNow = last ? percentOf(reingestUnits(size, ttlMs(ttl))) : null
+    const freshNow = last ? percentOf(freshStartUnits(size, baseline, ttlMs(ttl), left > 0)) : null
+    const costLine = [
+      reingestNow && `this context re-ingests at ${reingestNow} of 5h`,
+      Number.isFinite(payoff) && size >= policy.compactAtTokens && `a fresh start pays off after ~${payoff} requests`,
+      freshNow && `starting fresh now ≈ ${freshNow}`,
+    ]
+      .filter(Boolean)
+      .join(' · ')
+
+    return (
+      <Box flexDirection="column">
+        <Box key="title" flexDirection="row" columnGap={1}>
+          <Text bold color="cyan">{sp('⚡ PROMPT CACHE')}</Text>
+          <Text dimColor>{sp(`· ${ttl} lifetime (${ttlSource})`)}</Text>
+        </Box>
+
+        <Box key="clock" flexDirection="column" marginTop={1}>
+          <Text bold color={clockColor}>{sp(counting ? `⏱ ${left > 0 ? fmtClock(left) : '0:00'}` : '⏱ --:--')}</Text>
+          {counting ? (
+            <Box flexDirection="row" columnGap={1}>
+              {solid('life', [[lifeFilled, clockColor], [barW - lifeFilled, 'gray']])}
+              <Text dimColor>{sp(`${Math.round(life * 100)}%`)}</Text>
+            </Box>
+          ) : null}
+        </Box>
+
+        <Box key="advice" marginTop={1} flexDirection="column">
+          <Text bold color={stateColor}>{sp(`${icon} ${advice.text}`)}</Text>
+          {last ? <Text dimColor>{sp(fit(`${last.model} · prompt ${fmtTokens(size)} tokens`, width))}</Text> : null}
+        </Box>
+
+        {last ? (
+          <Box key="stack" flexDirection="column" marginTop={1}>
+            <Box flexDirection="row" columnGap={1}>
+              {solid('stack', [[sr, 'green'], [sw, 'yellow'], [sn, 'cyan']])}
+              <Text bold color={hitColor(Math.round(hitRatio(last) * 100))}>{sp(`${Math.round(hitRatio(last) * 100)}% hit`)}</Text>
+            </Box>
+            <Box flexDirection="row" columnGap={2}>
+              <Text color="green">{sp(`■ read ${fmtTokens(last.read)}`)}</Text>
+              <Text color="yellow">{sp(`■ wrote ${fmtTokens(last.write)}`)}</Text>
+              <Text color="cyan">{sp(`■ new ${fmtTokens(last.fresh)}`)}</Text>
+            </Box>
+          </Box>
+        ) : null}
+
+        {strip.length > 1 ? (
+          <Box key="history" flexDirection="column" marginTop={1}>
+            <Text dimColor>{sp('History · one cell per request · red = written again')}</Text>
+            <Box flexDirection="row">
+              {strip.map((s, i) => (
+                <Box key={`hist:${i}`} width={2} height={1} flexShrink={0} marginRight={1} backgroundColor={historyColor(hitRatio(s))} />
+              ))}
+            </Box>
+          </Box>
+        ) : null}
+
+        <Box key="table" flexDirection="column" marginTop={1}>
+          <Box key="head" flexDirection="row" columnGap={1}>
+            {cell('h:turn', 4, 'turn', 'cyan', true)}
+            {cell('h:steps', 5, 'steps', 'cyan', true)}
+            {cell('h:read', 6, 'read', 'green', true)}
+            {cell('h:wrote', 6, 'wrote', 'yellow', true)}
+            {cell('h:new', 5, 'new', 'cyan', true)}
+            {cell('h:hit', 4, 'hit', 'magenta', true)}
+          </Box>
+          {rows.length === 0 ? <Text dimColor>{sp('no requests yet')}</Text> : null}
+          {rows.map((row, i) => {
+            const n = all.length - rows.length + i + 1
+            const pct = Math.round(rowRatio(row) * 100)
+
+            return (
+              <Box key={`t:${row.turnId}`} flexDirection="row" columnGap={1}>
+                {cell(`c:turn:${row.turnId}`, 4, String(n))}
+                {cell(`c:steps:${row.turnId}`, 5, String(row.steps))}
+                {cell(`c:read:${row.turnId}`, 6, fmtTokens(row.read), 'green')}
+                {cell(`c:wrote:${row.turnId}`, 6, fmtTokens(row.write), 'yellow')}
+                {cell(`c:new:${row.turnId}`, 5, fmtTokens(row.fresh), 'cyan')}
+                {cell(`c:hit:${row.turnId}`, 4, `${pct}%`, hitColor(pct), true)}
+              </Box>
+            )
+          })}
+        </Box>
+
+        <Box key="today" flexDirection="column" marginTop={1}>
+          <Text bold color="cyan">{sp('Today, all sessions')}</Text>
+          {daily ? (
+            <Box flexDirection="row" columnGap={2}>
+              <Text color="green">{sp(saved ? `saved ≈ ${saved} of 5h` : `saved ${fmtTokens(Math.round(daily.savedUnits))} tokens`)}</Text>
+              <Text color={daily.reingests > 0 ? 'red' : undefined} dimColor={daily.reingests === 0}>
+                {sp(`${daily.reingests} re-ingest${daily.reingests === 1 ? '' : 's'}${lost ? ` cost ${lost}` : ''}`)}
+              </Text>
+            </Box>
+          ) : (
+            <Text dimColor>{sp('nothing yet today')}</Text>
+          )}
+          {last ? <Text dimColor>{sp(costLine || 'the percentages appear once enough turns are learned')}</Text> : null}
+        </Box>
+
+        <Box key="foot" marginTop={1} flexDirection="row" columnGap={1}>
+          {last && isIdle && left > 0 && <Button key="pane-keep-warm" label="Keep warm" onPress={() => keepWarm($, options)} />}
+          {last && isIdle && <Button key="pane-start-fresh" label="Start fresh" onPress={() => startFresh($)} />}
+          <Button
+            key="close"
+            label="Close"
+            onPress={async () => {
+              await $.ui.close({ id: PANE }).catch(() => undefined)
+              isPaneOpen = false
+              $.ui.invalidate('ui.render')
+            }}
+          />
+        </Box>
+
+        <Box key="legend" marginTop={1} flexDirection="column">
+          <Text color="green">{sp('■ read: served by the cache')}</Text>
+          <Text color="yellow">{sp('■ wrote: new cache entry')}</Text>
+          <Text color="cyan">{sp('■ new: sent uncached')}</Text>
+        </Box>
+      </Box>
+    )
+  })
 }
 
-/** The meter's pieces, or null before this conversation's first request. */
-async function drawMeter($: EngineInterface, e: any, isWorking: boolean) {
-  const record = await read($, last)
-  if (!record) {
-    return null
-  }
+/** A history cell's colour from its hit share: green, yellow, or red for a re-write. */
+function historyColor(hit: number): string {
+  const tone = historyTone(hit)
 
-  const rate = await read($, percentPerMillion)
-  const view = describe(record, await read($, ttlMs), await read($, now), isWorking, rate, await read($, baselineTokens))
-  const state = await read($, fresh)
-  const isWarming = await read($, warming)
-  const strip = await read($, history)
-  const today = await read($, daily)
-  const battery = barCells(view.battery, BAR_CELLS)
-  const { Box, Button, Text } = $.ui.resolve(e)
-
-  // "saved ≈ 41% of 5h today" once the rate is known, else in tokens.
-  let saved = ''
-  if (today && today.savedUnits > 0) {
-    saved =
-      rate === null
-        ? `saved ${formatTokens(Math.round(today.savedUnits))} today`
-        : `saved ≈ ${formatPercent((today.savedUnits / 1_000_000) * rate)} of 5h today`
-  }
-  const status =
-    state === 'writing' ? 'writing handoff brief…' : state === 'clearing' ? 'clearing…' : isWarming ? 'keeping warm…' : view.advice
-  const isIdle = state === 'idle' && !isWarming && !isWorking
-
-  return [
-    <Text key="dot" color={view.tone}>
-      {view.dot}
-    </Text>,
-    <Text key="name" color={view.tone}>
-      cache
-    </Text>,
-    // The battery: time left, draining and changing colour as the cache runs out. Solid
-    // blocks (spaces on a background): the desktop app draws block characters dotted.
-    <Box key="battery" flexShrink={0}>
-      <Text backgroundColor={view.tone}>{' '.repeat(battery.filled)}</Text>
-      <Text backgroundColor="inactive">{' '.repeat(battery.empty)}</Text>
-    </Box>,
-    view.timer && (
-      <Text key="timer" color={view.tone}>
-        {view.timer}
-      </Text>
-    ),
-    // History: one cell per recent request; red marks a re-ingest.
-    strip.length > 1 && (
-      <Box key="history" flexShrink={0}>
-        {strip.map((hit, index) => (
-          <Text key={`h${index}`} backgroundColor={historyTone(hit)}>
-            {' '}
-          </Text>
-        ))}
-      </Box>
-    ),
-    <Box key="text" flexGrow={1} flexShrink={1} minWidth={0} overflow="hidden">
-      <Text dimColor wrap="truncate-end">
-        {[view.stats, status, saved].filter(Boolean).join(' · ')}
-      </Text>
-    </Box>,
-    isIdle && view.isEnding && <Button key="cache-keep-warm" label="Keep warm" onPress={() => keepWarm($)} />,
-    isIdle && <Button key="cache-start-fresh" label="Start fresh" onPress={() => startFresh($)} />,
-  ]
+  return tone === 'success' ? 'green' : tone === 'warning' ? 'yellow' : 'red'
 }
