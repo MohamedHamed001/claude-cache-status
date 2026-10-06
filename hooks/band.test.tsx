@@ -13,13 +13,22 @@ const SAVED = {
   ttlMs: 3_600_000,
 }
 
+// Where the meter draws: the hint line under the prompt in the terminal, the band above
+// the prompt on the desktop (which draws no hint line).
 const hint = (surface: 'terminal' | 'desktop') =>
-  ({
-    plugin: 'cache-status',
-    surface,
-    component: 'PromptHint',
-    props: { isDraft: false, isWorking: false, hint: '? for shortcuts' },
-  }) as const
+  (surface === 'terminal'
+    ? {
+        plugin: 'cache-status',
+        surface,
+        component: 'PromptHint',
+        props: { isDraft: false, isWorking: false, hint: '? for shortcuts' },
+      }
+    : {
+        plugin: 'cache-status',
+        surface,
+        component: 'AbovePrompt',
+        props: { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 140, scroll: { offset: 0, bodyRows: 10 }, view: {} },
+      }) as never
 
 /** A reopened session whose last request finished `minutesAgo` ago; returns what buttons did. */
 async function reopenedSession($: any, on: any, minutesAgo: number, fork: object) {
@@ -47,11 +56,14 @@ async function reopenedSession($: any, on: any, minutesAgo: number, fork: object
     return { value: { turnId: 't' } }
   })
   on('ui.toast', () => ({ value: undefined }))
-  on('ui.render', { component: 'PromptHint' }, ($$: any, e: any) => {
-    const { Text } = $$.ui.resolve(e)
+  // What the app (and other plugins) draw in both places.
+  for (const component of ['PromptHint', 'AbovePrompt'] as const) {
+    on('ui.render', { component }, ($$: any, e: any) => {
+      const { Text } = $$.ui.resolve(e)
 
-    return <Text>ENGINE HINT</Text>
-  })
+      return <Text>ENGINE HINT</Text>
+    })
+  }
 
   await $.session.start({ cwd: 'D:/repo', surface: 'desktop', isInteractive: true } as never)
 

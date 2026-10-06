@@ -424,66 +424,113 @@ export const register: Register = on => {
     return result
   })
 
-  // The meter lives on the hint line under the prompt, apart from the other plugins' bands
-  // above it. The app's own hint ("? for shortcuts", "esc to interrupt") stays at the end.
+  // Where the meter draws: the terminal has a hint line under the prompt, apart from the
+  // bands above it; the desktop app draws no hint line, so there the meter is its own card
+  // in the band above the prompt.
   on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
     const engineHint = await next(e)
-    const record = await read($, last)
-    if (!record) {
-      return engineHint // no request yet in this conversation
+    if (e.surface !== 'terminal') {
+      return engineHint
     }
-
-    const rate = await read($, percentPerMillion)
-    const view = describe(record, await read($, ttlMs), await read($, now), e.props.isWorking, rate, await read($, baselineTokens))
-    const state = await read($, fresh)
-    const isWarming = await read($, warming)
-    const strip = await read($, history)
-    const today = await read($, daily)
-    const battery = barCells(view.battery, BAR_CELLS)
-    const { Box, Button, Text } = $.ui.resolve(e)
-
-    // "saved ≈ 41% of 5h today" once the rate is known, else in tokens.
-    let saved = ''
-    if (today && today.savedUnits > 0) {
-      saved =
-        rate === null
-          ? `saved ${formatTokens(Math.round(today.savedUnits))} today`
-          : `saved ≈ ${formatPercent((today.savedUnits / 1_000_000) * rate)} of 5h today`
+    const meter = await drawMeter($, e, e.props.isWorking)
+    if (!meter) {
+      return engineHint
     }
-    const status =
-      state === 'writing' ? 'writing handoff brief…' : state === 'clearing' ? 'clearing…' : isWarming ? 'keeping warm…' : view.advice
-    const isIdle = state === 'idle' && !isWarming && !e.props.isWorking
+    const { Box } = $.ui.resolve(e)
 
     return (
       <Box columnGap={1} alignItems="center">
-        <Text color={view.tone}>{view.dot}</Text>
-        <Text color={view.tone}>cache</Text>
-        {/* The battery: time left, draining and changing colour as the cache runs out. Solid
-            blocks (spaces on a background): the desktop app draws block characters dotted. */}
-        <Box>
-          <Text backgroundColor={view.tone}>{' '.repeat(battery.filled)}</Text>
-          <Text backgroundColor="inactive">{' '.repeat(battery.empty)}</Text>
-        </Box>
-        {view.timer && <Text color={view.tone}>{view.timer}</Text>}
-        {/* History: one cell per recent request; red marks a re-ingest. */}
-        {strip.length > 1 && (
-          <Box>
-            {strip.map((hit, index) => (
-              <Text key={`h${index}`} backgroundColor={historyTone(hit)}>
-                {' '}
-              </Text>
-            ))}
-          </Box>
-        )}
-        <Box flexGrow={1} flexShrink={1} minWidth={0} overflow="hidden">
-          <Text dimColor wrap="truncate-end">
-            {[view.stats, status, saved].filter(Boolean).join(' · ')}
-          </Text>
-        </Box>
-        {isIdle && view.isEnding && <Button key="cache-keep-warm" label="Keep warm" onPress={() => keepWarm($)} />}
-        {isIdle && <Button key="cache-start-fresh" label="Start fresh" onPress={() => startFresh($)} />}
+        {meter}
         {engineHint}
       </Box>
     )
   })
+
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    const beneath = await next(e)
+    if (e.surface === 'terminal' || e.props.hasSurvey) {
+      return beneath
+    }
+    const meter = await drawMeter($, e, e.props.isWorking)
+    if (!meter) {
+      return beneath
+    }
+    const { Box } = $.ui.resolve(e)
+
+    return (
+      <Box flexDirection="column" rowGap={1}>
+        {/* Its own filled card, one per plugin, so stacked bands read as separate. */}
+        <Box columnGap={1} alignItems="center" backgroundColor="userMessageBackground" paddingX={1}>
+          {meter}
+        </Box>
+        {beneath}
+      </Box>
+    )
+  })
+}
+
+/** The meter's pieces, or null before this conversation's first request. */
+async function drawMeter($: EngineInterface, e: any, isWorking: boolean) {
+  const record = await read($, last)
+  if (!record) {
+    return null
+  }
+
+  const rate = await read($, percentPerMillion)
+  const view = describe(record, await read($, ttlMs), await read($, now), isWorking, rate, await read($, baselineTokens))
+  const state = await read($, fresh)
+  const isWarming = await read($, warming)
+  const strip = await read($, history)
+  const today = await read($, daily)
+  const battery = barCells(view.battery, BAR_CELLS)
+  const { Box, Button, Text } = $.ui.resolve(e)
+
+  // "saved ≈ 41% of 5h today" once the rate is known, else in tokens.
+  let saved = ''
+  if (today && today.savedUnits > 0) {
+    saved =
+      rate === null
+        ? `saved ${formatTokens(Math.round(today.savedUnits))} today`
+        : `saved ≈ ${formatPercent((today.savedUnits / 1_000_000) * rate)} of 5h today`
+  }
+  const status =
+    state === 'writing' ? 'writing handoff brief…' : state === 'clearing' ? 'clearing…' : isWarming ? 'keeping warm…' : view.advice
+  const isIdle = state === 'idle' && !isWarming && !isWorking
+
+  return [
+    <Text key="dot" color={view.tone}>
+      {view.dot}
+    </Text>,
+    <Text key="name" color={view.tone}>
+      cache
+    </Text>,
+    // The battery: time left, draining and changing colour as the cache runs out. Solid
+    // blocks (spaces on a background): the desktop app draws block characters dotted.
+    <Box key="battery" flexShrink={0}>
+      <Text backgroundColor={view.tone}>{' '.repeat(battery.filled)}</Text>
+      <Text backgroundColor="inactive">{' '.repeat(battery.empty)}</Text>
+    </Box>,
+    view.timer && (
+      <Text key="timer" color={view.tone}>
+        {view.timer}
+      </Text>
+    ),
+    // History: one cell per recent request; red marks a re-ingest.
+    strip.length > 1 && (
+      <Box key="history" flexShrink={0}>
+        {strip.map((hit, index) => (
+          <Text key={`h${index}`} backgroundColor={historyTone(hit)}>
+            {' '}
+          </Text>
+        ))}
+      </Box>
+    ),
+    <Box key="text" flexGrow={1} flexShrink={1} minWidth={0} overflow="hidden">
+      <Text dimColor wrap="truncate-end">
+        {[view.stats, status, saved].filter(Boolean).join(' · ')}
+      </Text>
+    </Box>,
+    isIdle && view.isEnding && <Button key="cache-keep-warm" label="Keep warm" onPress={() => keepWarm($)} />,
+    isIdle && <Button key="cache-start-fresh" label="Start fresh" onPress={() => startFresh($)} />,
+  ]
 }
