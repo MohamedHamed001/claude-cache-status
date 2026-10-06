@@ -9,16 +9,17 @@ import type { On } from 'claude-code'
 type Calls = { ran: string[]; sent: string[]; toasts: string[] }
 
 /** The engine beneath the plugin: one main request that read 80k from the cache. */
-function fakeEngine(on: On, fork: object = { isAnswered: true, text: 'Goal: ship it.' }): Calls {
+function fakeEngine(on: On, fork: object = { isAnswered: true, text: 'Goal: ship it.' }, saved?: object): Calls {
   const calls: Calls = { ran: [], sent: [], toasts: [] }
   on('session.usage', () => ({ value: { startedAt: 0, context: {}, rateLimits: [{ kind: 'five_hour', percentUsed: 40 }] } }) as never)
   on('session.start', async ($, e) => ({ cwd: e.cwd }) as never)
   on('session.cwd', () => ({ value: 'D:/repo' }) as never)
+  on('session.id', () => ({ value: 's1' }) as never)
   on('env.get', () => ({ value: undefined }))
   on('fs.read', () => {
     throw new Error('ENOENT')
   })
-  on('store.get', () => ({ value: undefined }))
+  on('store.get', ($, e) => ({ value: (e as { key: string }).key === 'sessions' ? saved : undefined }))
   on('store.set', () => ({ value: undefined }) as never)
   on('command.register', () => ({ value: undefined }) as never)
   on('clock.every', () => ({ value: undefined }) as never)
@@ -76,11 +77,11 @@ const pane = ($: Engine) =>
   $.ui.mount({ plugin: 'cache-status', surface: 'desktop', component: 'Pane', requestId: 'cache', props: { bodyColumns: 80 } } as never)
 
 for (const surface of ['terminal', 'desktop'] as const) {
-  test(`on ${surface}: nothing before the first request, then the meter above what others drew`, async ($, on) => {
+  test(`on ${surface}: a placeholder before the first request, then the meter above what others drew`, async ($, on) => {
     fakeEngine(on)
     await $.session.start({ cwd: 'D:/repo', surface, isInteractive: true } as never)
     let ui = await band($, surface)
-    expect((await ui.find({ text: /cache/ })) === undefined).toBe(true)
+    expect((await ui.find({ text: /no request yet/ })) !== undefined).toBe(true)
 
     await step($)
     ui = await band($, surface)
@@ -92,6 +93,14 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect((await ui.find({ text: /OTHERS/ })) !== undefined).toBe(true)
   })
 }
+
+test('a reopened session shows its meter at once, from its saved last request', async ($, on) => {
+  const last = { turnId: 't0', index: 0, model: 'claude-opus-5-5', startedAt: Date.now() - 60_000, read: 300_000, write: 2_000, fresh: 100, output: 50 }
+  fakeEngine(on, undefined, { s1: last })
+  await $.session.start({ cwd: 'D:/repo', surface: 'desktop', isInteractive: true } as never)
+  const ui = await band($, 'desktop')
+  expect((await ui.find({ text: /read 300k/ })) !== undefined).toBe(true)
+})
 
 // warnSeconds above the lifetime puts the cache in its last stretch at once.
 test('when it is about to lapse, Keep warm re-reads the cache', { options: { ttl: '5m', warnSeconds: 3600 } }, async ($, on) => {

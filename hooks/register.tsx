@@ -75,6 +75,10 @@ const HISTORY_CELLS = 24
 const CALIBRATION_KEY = 'calibration' // per model: recent "percent of 5h per million cost units"
 const BASELINE_KEY = 'baseline' // sizes of conversations' first requests
 const DAILY_KEY = 'daily' // today's saved and re-ingest totals
+// Per session id: its last request, so a reopened session shows its meter at once instead
+// of waiting for the next request. Entries older than three days are dropped.
+const SESSIONS_KEY = 'sessions'
+const KEEP_SAVED_MS = 3 * 24 * 60 * 60 * 1000
 const MAX_BASELINE_SAMPLE = 100_000
 // The smallest possible request: it re-reads the conversation from the cache, which
 // restarts the cache's lifetime, and answers with one word.
@@ -219,6 +223,15 @@ async function recordSample($: EngineInterface, sample: Sample, options: Record<
   const stored = ((await $.store.get(DAILY_KEY)) ?? null) as Daily | null
   daily = addToDaily(stored, dayOf(sample.startedAt), savedUnits(usageOf(sample)), reingest)
   await $.store.set(DAILY_KEY, daily)
+
+  // This session's last request, for when it is reopened.
+  const id = await $.session.id()
+  const saved = ((await $.store.get(SESSIONS_KEY)) ?? {}) as Record<string, Sample>
+  saved[id] = sample
+  for (const [key, old] of Object.entries(saved)) {
+    if (old.startedAt < sample.startedAt - KEEP_SAVED_MS) delete saved[key]
+  }
+  await $.store.set(SESSIONS_KEY, saved)
 
   lastKey = ''
   $.ui.invalidate('ui.render')
@@ -374,6 +387,13 @@ export const register: Register = (on, options) => {
       if (sizes.length > 0) baseline = median(sizes)
       const stored = ((await $.store.get(DAILY_KEY)) ?? null) as Daily | null
       daily = stored && stored.day === dayOf(Date.now()) ? stored : null
+      // A reopened session: its last request, so the meter shows at once.
+      const saved = ((await $.store.get(SESSIONS_KEY)) ?? {}) as Record<string, Sample>
+      const mine = saved[await $.session.id()]
+      if (mine && typeof mine.startedAt === 'number' && typeof mine.read === 'number') {
+        samples = [mine]
+        await loadRate($, mine.model).catch(() => undefined)
+      }
     } catch {
       // The meter works without them.
     }
@@ -516,11 +536,12 @@ export const register: Register = (on, options) => {
     if (e.props.hasSurvey || isPaneOpen) return beneath
     const now = Date.now()
     const { last, advice, left } = current(policy, now)
-    if (!last && advice.kind !== 'off') return beneath
     const { Box, Button, Text } = $.ui.resolve(e)
     const columns = e.props.bodyColumns ?? 100
     const color = COLOR[advice.kind]
 
+    // Before this conversation's first request (a new session, or after /clear): a quiet
+    // placeholder, so the meter is visibly there.
     if (!last) {
       return (
         <Box flexDirection="column" rowGap={1}>
