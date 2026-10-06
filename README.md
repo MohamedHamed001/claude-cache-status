@@ -34,16 +34,30 @@ re-ingest. Every request restarts the timer.
 
 **What you see.**
 
-| State | Line |
+One line in its own box above the prompt:
+
+```
+● cache ████████████ 99%  42:00 left  186k ctx · read 184k · new 2k · re-ingest ≈ 3.0% · warm: keep going  [ Start fresh ]
+```
+
+| Part | Means |
 |---|---|
-| Turn running | `● cache in use · 186k context` |
-| Warm | `● cache warm · ~42m left · 186k context` |
-| Last 5 minutes | the same, with an amber dot |
-| Cold | `○ cache cold · next message re-ingests about 186k tokens` |
+| Bar and `99%` | Share of the last request read from the cache: near 100% means the cache is doing its job |
+| `42:00 left` | Countdown until the cache goes cold (an estimate, see below) |
+| `186k ctx · read 184k · new 2k` | Conversation size, and how the last request split between cache and fresh tokens |
+| `re-ingest ≈ 3.0%` | Share of your 5-hour window the next message would use if the cache went cold |
+| Advice | `warm: keep going`; in the last 5 minutes (amber) `send now to keep it warm, or start fresh while it is cheap (≈ 0.7%)`; once cold (red) `next message re-reads 186k ≈ 3.0% of 5h` |
 | After a re-ingest | pop-up: `Cache was cold: re-ingested 186k tokens. 5h window 41% → 44% this turn.` |
 
-Once it has seen enough of your turns, the warm and cold lines also show what a re-ingest would
-cost: `re-ingest ≈ 3.0% of 5h`.
+The percentages appear once it has seen enough of your turns to estimate them.
+
+**Start fresh.** One press: Claude writes a handoff brief (goal, what is done, files, decisions,
+open questions, next step), the conversation is cleared with `/clear`, and the brief is sent as
+the new conversation's first message. If the brief cannot be written, nothing is cleared.
+
+Writing the brief reads the whole conversation once: cheap while the cache is warm, a full
+re-ingest once it is cold. So the best time to start fresh is while it is still warm; the band
+says so in its last five minutes.
 
 **What is exact and what is estimated.**
 

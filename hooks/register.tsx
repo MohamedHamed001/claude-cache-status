@@ -22,9 +22,12 @@ import type { EngineInterface, Register, SessionRateLimit } from 'claude-code'
 
 import type { LastRequest } from '../types'
 import {
+  BRIEF_PROMPT,
+  DEFAULT_BASELINE_TOKENS,
   FIVE_MINUTES_MS,
   ONE_HOUR_MS,
   addSample,
+  barCells,
   contextTokens,
   costUnits,
   describe,
@@ -32,11 +35,18 @@ import {
   isReingest,
   learnTtl,
   learnedRate,
+  median,
   promptTokens,
 } from './logic'
 import type { Usage } from './logic'
 
-const TICK_MS = 30_000
+// Every second, so the countdown shows minutes and seconds.
+const TICK_MS = 1_000
+const BAR_CELLS = 12
+// Shared by all sessions: sizes of conversations' first requests, to estimate a fresh start.
+const BASELINE_KEY = 'baseline'
+// A first request bigger than this is a reopened old conversation, not a fresh one.
+const MAX_BASELINE_SAMPLE = 100_000
 // Saved records older than this are dropped from the store.
 const KEEP_SAVED_MS = 3 * 24 * 60 * 60 * 1000
 const STORE_KEY = 'sessions'
@@ -54,6 +64,8 @@ const last = atom({ plugin: 'cache-status', key: 'last' } as const, null)
 const ttlMs = atom({ plugin: 'cache-status', key: 'ttlMs' } as const, ONE_HOUR_MS)
 const now = atom({ plugin: 'cache-status', key: 'now' } as const, 0)
 const percentPerMillion = atom({ plugin: 'cache-status', key: 'percentPerMillion' } as const, null)
+const baselineTokens = atom({ plugin: 'cache-status', key: 'baselineTokens' } as const, DEFAULT_BASELINE_TOKENS)
+const fresh = atom({ plugin: 'cache-status', key: 'fresh' } as const, 'idle')
 
 // Plain variables for the turn in progress. They are not drawn, and losing them on a
 // reload only costs one pop-up.
@@ -109,14 +121,75 @@ async function recordRequest($: EngineInterface, usage: Usage & { model: string 
     if (wasReingest) {
       reingestedTokens = promptTokens(usage)
     }
+  } else {
+    await learnBaseline($, contextTokens(usage))
   }
 
   await update($, last, () => ({
     at: finishedAt,
     contextTokens: contextTokens(usage),
     model: usage.model,
+    readTokens: usage.cache_read_input_tokens,
+    newTokens: usage.input_tokens + usage.cache_creation_input_tokens,
   }))
   await update($, now, () => finishedAt)
+}
+
+/**
+ * A conversation's first request shows how big a fresh start is (system prompt, tools,
+ * instructions). Keep the last 20 such sizes, shared by all sessions; use their median.
+ */
+async function learnBaseline($: EngineInterface, tokens: number) {
+  if (tokens > MAX_BASELINE_SAMPLE) {
+    return
+  }
+  const samples = [...(((await $.store.get(BASELINE_KEY)) ?? []) as number[]), tokens].slice(-20)
+  await $.store.set(BASELINE_KEY, samples)
+  await update($, baselineTokens, () => median(samples))
+}
+
+/** A new conversation (after /clear) starts with no cache and no turn in progress. */
+async function forgetConversation($: EngineInterface) {
+  await update($, last, () => null)
+  reingestedTokens = 0
+  turnUnits = 0
+  turnModel = null
+  isTurnMixed = false
+}
+
+/**
+ * "Start fresh": Claude writes a handoff brief, the conversation is cleared, and the brief
+ * is sent as the new conversation's first message. If the brief cannot be written, nothing
+ * is cleared.
+ */
+async function startFresh($: EngineInterface) {
+  if ((await read($, fresh)) !== 'idle') {
+    return
+  }
+  await update($, fresh, () => 'writing')
+  try {
+    // Reads the conversation through the cache: cheap while it is warm.
+    const reply = await $.model.fork({ prompt: BRIEF_PROMPT })
+    if (!reply.isAnswered) {
+      $.ui.toast(`Could not write the handoff brief (${reply.reason}). Nothing was cleared.`)
+      return
+    }
+    await update($, fresh, () => 'clearing')
+    await $.command.run({ command: 'clear' })
+    await forgetConversation($)
+    // Not awaited: it is queued and starts once the cleared session is idle.
+    void $.prompt
+      .submit({
+        text: `Handoff brief from the previous conversation, which was cleared to start fresh:\n\n${reply.text.trim()}`,
+        asUser: true,
+      })
+      .catch(() => undefined)
+    $.ui.toast('Started fresh: handoff brief sent')
+  } catch (error) {
+    $.ui.toast(`Start fresh failed: ${error instanceof Error ? error.message : String(error)}`)
+  } finally {
+    await update($, fresh, () => 'idle')
+  }
 }
 
 /** Save this session's record so it survives the app closing. */
@@ -188,7 +261,7 @@ export const register: Register = on => {
       if (mine) {
         // A record without a model gets '', which simply finds no learned rate.
         const model = mine.model ?? ''
-        await update($, last, () => ({ at: mine.at, contextTokens: mine.contextTokens, model }))
+        await update($, last, () => ({ ...mine, model }))
         await update($, ttlMs, () => mine.ttlMs)
         await loadRate($, model)
       }
@@ -201,6 +274,11 @@ export const register: Register = on => {
       }
 
       await rememberLimits($, (await $.session.usage()).rateLimits)
+
+      const baseline = ((await $.store.get(BASELINE_KEY)) ?? []) as number[]
+      if (baseline.length > 0) {
+        await update($, baselineTokens, () => median(baseline))
+      }
     } catch {
       // Start with what we have; the first request fills in the rest.
     }
@@ -211,6 +289,15 @@ export const register: Register = on => {
     }
     void tick()
     $.clock.every(TICK_MS, () => void tick())
+
+    return next(e)
+  })
+
+  // A /clear ends the conversation (no session.start follows): its cache is gone with it.
+  on('session.end', async ($, e, next) => {
+    if (e.reason === 'clear') {
+      await forgetConversation($).catch(() => undefined)
+    }
 
     return next(e)
   })
@@ -283,28 +370,36 @@ export const register: Register = on => {
       return beneath
     }
 
-    const line = describe(
+    const view = describe(
       record,
       await read($, ttlMs),
       await read($, now),
       e.props.isWorking,
       await read($, percentPerMillion),
+      await read($, baselineTokens),
     )
-    const { Box, Text } = $.ui.resolve(e)
+    const state = await read($, fresh)
+    const cells = barCells(view.hit ?? 0, BAR_CELLS)
+    const { Box, Button, Text } = $.ui.resolve(e)
 
     return (
       <Box flexDirection="column" rowGap={1}>
-        {/* Same three columns as other band mods, so stacked lines line up:
-            [ 2-cell icon ] [ text, takes the free space ] [ buttons, none here ] */}
-        <Box columnGap={1} alignItems="center">
-          <Box width={2}>
-            <Text color={line.tone}>{line.dot}</Text>
-          </Box>
+        {/* Its own rounded box, one per plugin, so stacked bands stay apart. */}
+        <Box columnGap={1} alignItems="center" borderStyle="round" borderDimColor paddingX={1}>
+          <Text color={view.tone}>{view.dot}</Text>
+          <Text color={view.tone}>cache</Text>
+          <Text color={view.tone}>{'█'.repeat(cells.filled)}</Text>
+          <Text dimColor>{'░'.repeat(cells.empty)}</Text>
+          {view.hit !== null && <Text>{Math.round(view.hit * 100)}%</Text>}
+          {view.timer && <Text color={view.tone}>{view.timer} left</Text>}
           <Box flexGrow={1} flexShrink={1}>
             <Text dimColor wrap="truncate-end">
-              {line.text}
+              {view.stats} · {state === 'writing' ? 'writing handoff brief…' : state === 'clearing' ? 'clearing…' : view.advice}
             </Text>
           </Box>
+          {state === 'idle' && !e.props.isWorking && (
+            <Button key="cache-start-fresh" label="Start fresh" onPress={() => startFresh($)} />
+          )}
         </Box>
         {beneath}
       </Box>

@@ -184,13 +184,80 @@ export function formatLeft(ms: number): string {
   return minutes < 1 ? '<1m' : `${minutes}m`
 }
 
-/** What the band shows: a dot, its colour, and the text beside it. */
-export type BandLine = { dot: string; tone: 'success' | 'warning' | 'error'; text: string }
+/** Time left as "54:36" (minutes and seconds), or "1:00:00" for a full hour. */
+export function formatClock(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000))
+  const hours = Math.floor(total / 3600)
+  const minutes = Math.floor((total % 3600) / 60)
+  const seconds = String(total % 60).padStart(2, '0')
+
+  return hours > 0 ? `${hours}:${String(minutes).padStart(2, '0')}:${seconds}` : `${minutes}:${seconds}`
+}
+
+/** Share of the last request that came from the cache, 0 to 1; null before any request. */
+export function hitShare(last: LastRequest): number | null {
+  const read = last.readTokens ?? null
+  const fresh = last.newTokens ?? null
+  if (read === null || fresh === null || read + fresh === 0) {
+    return null
+  }
+
+  return read / (read + fresh)
+}
+
+/** A text bar of `width` cells for a share from 0 to 1: how many are filled. */
+export function barCells(share: number, width: number): { filled: number; empty: number } {
+  const filled = Math.round(Math.min(1, Math.max(0, share)) * width)
+
+  return { filled, empty: width - filled }
+}
+
+// ---------------------------------------------------------------------------
+// Starting fresh: Claude writes a handoff brief, the conversation is cleared, and the
+// brief becomes the first message of the new one.
+//
+// Writing the brief reads the whole conversation once. While the cache is warm that read
+// is cheap (cache-read price); once it is cold it costs a full re-ingest. So the best time
+// to start fresh is while the cache is still warm, which the band says in its last minutes.
+// ---------------------------------------------------------------------------
+
+/** Tokens a handoff brief is assumed to take, for the estimate. */
+export const BRIEF_TOKENS = 2_000
+/** A fresh conversation's own size (system prompt, tools, instructions) before it is learned. */
+export const DEFAULT_BASELINE_TOKENS = 30_000
+
+/** What starting fresh costs now: reading the conversation for the brief, plus the new start. */
+export function freshStartUnits(contextTokenCount: number, baselineTokens: number, ttlMs: number, isWarm: boolean): number {
+  const readForBrief = isWarm ? contextTokenCount * WEIGHT_CACHE_READ : reingestUnits(contextTokenCount, ttlMs)
+
+  return readForBrief + BRIEF_TOKENS * WEIGHT_OUTPUT + reingestUnits(baselineTokens + BRIEF_TOKENS, ttlMs)
+}
+
+/** The prompt that asks Claude for the handoff brief. */
+export const BRIEF_PROMPT = [
+  'Write a handoff brief so a new conversation can carry on this work without the old transcript.',
+  'Use these headings: Goal; Done so far; Current state (files touched, with paths); Decisions and why;',
+  'Open questions; Next step (one concrete action). Be specific: paths, commands, names, numbers.',
+  'No preamble and no closing remarks. Under 400 words.',
+].join(' ')
+
+/** Everything the band shows, worked out from the last request and the clock. */
+export type BandView = {
+  dot: '●' | '○'
+  tone: 'success' | 'warning' | 'error'
+  /** Share of the last request read from the cache, or null when unknown. */
+  hit: number | null
+  /** "186k ctx · read 184k · new 1.5k" */
+  stats: string
+  /** "54:36" while warm; null while a turn runs or once cold. */
+  timer: string | null
+  /** One short piece of advice: what to do now. */
+  advice: string
+}
 
 /**
- * Turn the last request into the band's line.
- * The countdown is "last request + assumed lifetime", so it is an estimate ("~").
- * `percentPerMillion` is the learned rate; when it is null no percentage is shown.
+ * Turn the last request into the band.
+ * `percentPerMillion` is the learned rate; without it no percentages are shown.
  */
 export function describe(
   last: LastRequest,
@@ -198,16 +265,21 @@ export function describe(
   now: number,
   isWorking: boolean,
   percentPerMillion: number | null,
-): BandLine {
+  baselineTokens: number = DEFAULT_BASELINE_TOKENS,
+): BandView {
   const size = formatTokens(last.contextTokens)
-  const cost =
-    percentPerMillion === null
-      ? null
-      : formatPercent((reingestUnits(last.contextTokens, ttlMs) / 1_000_000) * percentPerMillion)
+  const parts = [`${size} ctx`]
+  if (last.readTokens !== undefined && last.newTokens !== undefined) {
+    parts.push(`read ${formatTokens(last.readTokens)}`, `new ${formatTokens(last.newTokens)}`)
+  }
+  const percentOf = (units: number) =>
+    percentPerMillion === null ? null : formatPercent((units / 1_000_000) * percentPerMillion)
+  const reingestCost = percentOf(reingestUnits(last.contextTokens, ttlMs))
+  const hit = hitShare(last)
 
-  // While a turn is running, every request restarts the timer, so there is no countdown.
+  // While a turn runs, every request restarts the timer, so there is no countdown.
   if (isWorking) {
-    return { dot: '●', tone: 'success', text: `cache in use · ${size} context` }
+    return { dot: '●', tone: 'success', hit, stats: parts.join(' · '), timer: null, advice: 'in use' }
   }
 
   const left = last.at + ttlMs - now
@@ -215,17 +287,27 @@ export function describe(
     return {
       dot: '○',
       tone: 'error',
-      text:
-        `cache cold · next message re-ingests about ${size} tokens` +
-        (cost ? ` (≈ ${cost} of 5h window)` : ''),
+      hit: 0,
+      stats: parts.join(' · '),
+      timer: null,
+      advice: `cold: next message re-reads ${size}` + (reingestCost ? ` ≈ ${reingestCost} of 5h` : ''),
     }
+  }
+
+  const lastMinutes = left < FIVE_MINUTES_MS
+  const freshCost = percentOf(freshStartUnits(last.contextTokens, baselineTokens, ttlMs, true))
+  if (reingestCost) {
+    parts.push(`re-ingest ≈ ${reingestCost}`)
   }
 
   return {
     dot: '●',
-    tone: left < FIVE_MINUTES_MS ? 'warning' : 'success',
-    text:
-      `cache warm · ~${formatLeft(left)} left · ${size} context` +
-      (cost ? ` · re-ingest ≈ ${cost} of 5h` : ''),
+    tone: lastMinutes ? 'warning' : 'success',
+    hit,
+    stats: parts.join(' · '),
+    timer: formatClock(left),
+    advice: lastMinutes
+      ? 'send now to keep it warm, or start fresh while it is cheap' + (freshCost ? ` (≈ ${freshCost})` : '')
+      : 'warm: keep going',
   }
 }

@@ -9,8 +9,12 @@ import {
   addSample,
   contextTokens,
   costUnits,
+  barCells,
   describe,
+  formatClock,
   formatLeft,
+  freshStartUnits,
+  hitShare,
   formatPercent,
   formatTokens,
   isReingest,
@@ -118,41 +122,67 @@ test('percentages are shortened for the band', () => {
   expect(formatPercent(0.03)).toBe('<0.1%')
 })
 
-const LAST = { at: 1_000_000, contextTokens: 186_000, model: 'claude-opus-5-5' }
 
-test('band: warm with time left', () => {
-  expect(describe(LAST, ONE_HOUR_MS, LAST.at + 18 * MINUTE, false, null)).toEqual({
+// 186k context; the last request read 184k from the cache and processed 1.5k fresh.
+const LAST = { at: 1_000_000, contextTokens: 186_000, model: 'claude-opus-5-5', readTokens: 184_000, newTokens: 1_500 }
+
+test('clock: minutes and seconds, hours when the full hour is left', () => {
+  expect(formatClock(54 * MINUTE + 36_000)).toBe('54:36')
+  expect(formatClock(5_000)).toBe('0:05')
+  expect(formatClock(ONE_HOUR_MS)).toBe('1:00:00')
+  expect(formatClock(-1)).toBe('0:00')
+})
+
+test('hit share and bar: how much of the last request came from the cache', () => {
+  expect(Math.round((hitShare(LAST) ?? 0) * 1000)).toBe(992)
+  expect(hitShare({ at: 0, contextTokens: 1, model: 'm' })).toBe(null) // older saved record
+  expect(barCells(0.99, 12)).toEqual({ filled: 12, empty: 0 })
+  expect(barCells(0.5, 12)).toEqual({ filled: 6, empty: 6 })
+  expect(barCells(1.5, 12)).toEqual({ filled: 12, empty: 0 })
+})
+
+test('band: warm with the countdown and the token split', () => {
+  expect(describe(LAST, ONE_HOUR_MS, LAST.at + 18 * MINUTE, false, null)).toMatchObject({
     dot: '●',
     tone: 'success',
-    text: 'cache warm · ~42m left · 186k context',
+    stats: '186k ctx · read 184k · new 2k',
+    timer: '42:00',
+    advice: 'warm: keep going',
   })
 })
 
-test('band: amber in the last five minutes', () => {
-  expect(describe(LAST, ONE_HOUR_MS, LAST.at + 57 * MINUTE, false, null).tone).toBe('warning')
+test('band: in the last five minutes it says to send now or start fresh while cheap', () => {
+  // Fresh start while warm: 186k read at 0.1 + 2k brief at 5 + 32k new start at 2 = 92.6k units.
+  const view = describe(LAST, ONE_HOUR_MS, LAST.at + 57 * MINUTE, false, 8)
+  expect(view.tone).toBe('warning')
+  expect(view.timer).toBe('3:00')
+  expect(view.advice).toBe('send now to keep it warm, or start fresh while it is cheap (≈ 0.7%)')
 })
 
-test('band: cold once the lifetime has passed', () => {
-  expect(describe(LAST, ONE_HOUR_MS, LAST.at + 61 * MINUTE, false, null)).toEqual({
+test('band: cold says what the next message will cost', () => {
+  // 186k context x2 = 372k units; at 8% per million that is about 3.0%.
+  expect(describe(LAST, ONE_HOUR_MS, LAST.at + 61 * MINUTE, false, 8)).toMatchObject({
     dot: '○',
     tone: 'error',
-    text: 'cache cold · next message re-ingests about 186k tokens',
+    hit: 0,
+    timer: null,
+    advice: 'cold: next message re-reads 186k ≈ 3.0% of 5h',
   })
 })
 
 test('band: no countdown while a turn is running', () => {
-  expect(describe(LAST, ONE_HOUR_MS, LAST.at + 61 * MINUTE, true, 8).text).toBe('cache in use · 186k context')
-})
-
-test('band: with a learned rate, the cold line says what the re-ingest will cost', () => {
-  // 186k context x2 = 372k units; at 8% per million that is about 3.0%.
-  expect(describe(LAST, ONE_HOUR_MS, LAST.at + 61 * MINUTE, false, 8).text).toBe(
-    'cache cold · next message re-ingests about 186k tokens (≈ 3.0% of 5h window)',
-  )
+  expect(describe(LAST, ONE_HOUR_MS, LAST.at + 61 * MINUTE, true, 8)).toMatchObject({ timer: null, advice: 'in use' })
 })
 
 test('band: with a learned rate, the warm line shows the cost of letting it go cold', () => {
-  expect(describe(LAST, ONE_HOUR_MS, LAST.at + 18 * MINUTE, false, 8).text).toBe(
-    'cache warm · ~42m left · 186k context · re-ingest ≈ 3.0% of 5h',
+  expect(describe(LAST, ONE_HOUR_MS, LAST.at + 18 * MINUTE, false, 8).stats).toBe(
+    '186k ctx · read 184k · new 2k · re-ingest ≈ 3.0%',
   )
+})
+
+test('a fresh start costs far less while warm than once cold', () => {
+  const warm = freshStartUnits(186_000, 30_000, ONE_HOUR_MS, true)
+  const cold = freshStartUnits(186_000, 30_000, ONE_HOUR_MS, false)
+  expect(warm).toBe(92_600)
+  expect(cold).toBe(186_000 * 2 + 10_000 + 64_000)
 })
