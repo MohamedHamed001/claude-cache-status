@@ -8,6 +8,7 @@ import {
   ONE_HOUR_MS,
   addSample,
   addToDaily,
+  calmClock,
   costUnits,
   dayOf,
   formatPercent,
@@ -87,4 +88,15 @@ test('today: saved units add up per day and a new day starts over', () => {
   expect(second).toEqual({ day: '2026-10-07', savedUnits: 100_000, reingestUnits: 372_000, reingests: 1 })
   expect(addToDaily(second, '2026-10-08', 5, 0)).toEqual({ day: '2026-10-08', savedUnits: 5, reingestUnits: 0, reingests: 0 })
   expect(dayOf(new Date(2026, 9, 7, 23, 59).getTime())).toBe('2026-10-07')
+})
+
+test('the drawn countdown changes rarely: minutes, then 5-second steps at the end', () => {
+  // Every change redraws the band and replaces its buttons, so fewer changes, fewer lost clicks.
+  expect(calmClock(58 * 60_000 + 57_000)).toBe('59m')
+  expect(calmClock(58 * 60_000 + 1_000)).toBe('59m') // the same text for the whole minute
+  expect(calmClock(5 * 60_000 + 1)).toBe('6m')
+  expect(calmClock(4 * 60_000 + 33_000)).toBe('4:35')
+  expect(calmClock(4 * 60_000 + 31_000)).toBe('4:35') // the same text for five seconds
+  expect(calmClock(3_000)).toBe('0:05')
+  expect(calmClock(0)).toBe('0:00')
 })

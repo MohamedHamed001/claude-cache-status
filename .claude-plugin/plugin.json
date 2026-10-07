@@ -1,6 +1,6 @@
 {
   "name": "cache-status",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Prompt-cache meter above the prompt, built on prompt-cache-control: read / wrote / new tokens per request, a live countdown, why the cache missed, and pop-ups before it lapses; plus what a re-ingest costs in your 5-hour window, what the cache saved today, Keep warm, Start fresh, and a /cache pane with a per-turn table and history",
   "author": {
     "name": "Mohamed Hamed"
@@ -36,6 +36,12 @@
       "type": "boolean",
       "title": "Pop-ups near expiry",
       "description": "Pop-ups as the cache lapses: at the warning threshold, then at 10, 3, 2 and 1 seconds (only for prompts of 20k tokens or more)",
+      "default": true
+    },
+    "guard": {
+      "type": "boolean",
+      "title": "Ask before an expensive message",
+      "description": "When the cache has expired on a large conversation, ask before sending: send anyway, start fresh with a brief, clear without one, or cancel",
       "default": true
     }
   }

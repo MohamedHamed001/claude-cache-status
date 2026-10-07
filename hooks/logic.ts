@@ -204,3 +204,21 @@ export function payoffRequests(contextTokenCount: number, baselineTokens: number
 
   return Math.ceil(freshStartUnits(contextTokenCount, baselineTokens, ttlMs, true) / savedPerRequest)
 }
+
+/**
+ * The countdown as drawn. Every change of this text redraws the whole band, and a redraw
+ * replaces every plugin's buttons there, so a click landing during one is lost. So the
+ * text changes rarely: whole minutes while there is plenty of time ("58m"), then minutes
+ * and seconds in 5-second steps for the last five minutes ("4:35").
+ */
+export function calmClock(leftMs: number): string {
+  if (leftMs <= 0) {
+    return '0:00'
+  }
+  if (leftMs > FIVE_MINUTES_MS) {
+    return `${Math.ceil(leftMs / 60_000)}m`
+  }
+  const seconds = Math.ceil(leftMs / 5_000) * 5
+
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`
+}

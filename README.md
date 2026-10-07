@@ -50,7 +50,7 @@ One row above the prompt:
 | Bar and `99%` | Share of the last request read from the cache |
 | `712k tok` | The conversation size; the read / wrote / new split is in the pane |
 | **Cache** button | Opens the /cache pane (the band hides while it is open) |
-| `⏱ 42:00` | Time left, counted from the start of the last request; green, yellow below 40% of the lifetime, red in the last minute |
+| `⏱ 42m` | Time left, counted from the start of the last request: whole minutes, then `4:35` in 5-second steps for the last five minutes (each change redraws the band, and a redraw can swallow a click); green, yellow below 40% of the lifetime, red in the last minute |
 | `1h` | The cache lifetime in use (see below) |
 | Advice | What to do: keep going, send a message soon, start fresh or `/compact`, or why the cache missed |
 | `3.0% of 5h` | What a re-ingest of this conversation would cost in your 5-hour window, learned from your own turns |
@@ -70,6 +70,22 @@ conversation is cleared with `/clear`, and the brief is sent as the new conversa
 message. If the brief cannot be written, nothing is cleared. Writing the brief reads the whole
 conversation once: cheap while the cache is warm, a full re-ingest once it has lapsed, so the
 best time is while it is still warm.
+
+## The guard
+
+When the cache has expired on a large conversation (`compactAtTokens`, 100k by default) and you
+send a message, the plugin asks first: the message would re-write the whole conversation at
+full price.
+
+| Answer | What happens |
+|---|---|
+| Send anyway | The message goes through |
+| Start fresh with a brief | Handoff brief, `/clear`, then the brief with your message after it. Writing the brief re-reads the conversation once (the same cost), but every later request is cheap |
+| Clear and send, no brief | `/clear`, then only your message: no re-read, and Claude forgets this conversation |
+| Cancel (or dismissing the question) | Nothing is sent; your message goes back in the prompt box |
+
+Slash commands and prompts sent by plugins are never held. Switch it off with the
+**Ask before an expensive message** setting.
 
 ## The /cache pane
 
@@ -98,6 +114,7 @@ In `/config` (or `pluginConfigs` in settings):
 | `warnSeconds` | 60 | When the band turns yellow, Keep warm appears and the first pop-up comes |
 | `compactAtTokens` | 100000 | From this size up, an expired cache offers Start fresh |
 | `toast` | on | The pop-ups near expiry |
+| `guard` | on | Ask before sending a message that would re-write a large expired conversation |
 
 ## What is exact and what is estimated
 

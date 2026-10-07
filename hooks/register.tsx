@@ -16,7 +16,9 @@
 // What happens when:
 //   each main request    -> one Sample (read / wrote / new tokens), the lifetime rules,
 //                           today's totals, and the 5h-rate bookkeeping for the turn
-//   every second         -> redraw the countdown when its text changes; countdown pop-ups
+//   every second         -> redraw the countdown when its text changes (once a minute, or every
+//                           5 s near the end: a redraw replaces the band's buttons, so a click
+//                           landing during one is lost); countdown pop-ups
 //   end of a turn        -> learn the 5h rate from the turn; a pop-up after a re-ingest
 //   drawing              -> the band (all surfaces), and /cache
 
@@ -28,6 +30,7 @@ import {
   DEFAULT_BASELINE_TOKENS,
   addSample,
   addToDaily,
+  calmClock,
   costUnits,
   dayOf,
   formatPercent,
@@ -277,10 +280,10 @@ async function keepWarm($: EngineInterface, options: Record<string, unknown>) {
 
 /**
  * Start fresh: Claude writes a handoff brief, the conversation is cleared, and the brief
- * is sent as the new conversation's first message. If the brief cannot be written,
- * nothing is cleared.
+ * is sent as the new conversation's first message (with `followUp`, the message the guard
+ * held back, after it). If the brief cannot be written, nothing is cleared.
  */
-async function startFresh($: EngineInterface) {
+async function startFresh($: EngineInterface, followUp?: string) {
   if (freshState !== 'idle') return
   freshState = 'writing'
   $.ui.invalidate('ui.render')
@@ -297,7 +300,9 @@ async function startFresh($: EngineInterface) {
     // Not awaited: it is queued and starts once the cleared session is idle.
     void $.prompt
       .submit({
-        text: `Handoff brief from the previous conversation, which was cleared to start fresh:\n\n${reply.text.trim()}`,
+        text:
+          `Handoff brief from the previous conversation, which was cleared to start fresh:\n\n${reply.text.trim()}` +
+          (followUp ? `\n\nMy message:\n${followUp}` : ''),
         asUser: true,
       })
       .catch(() => undefined)
@@ -309,6 +314,25 @@ async function startFresh($: EngineInterface) {
     $.ui.invalidate('ui.render')
   }
 }
+
+/** The guard's "Clear and send": a new conversation with only the held message. */
+async function clearAndSend($: EngineInterface, text: string) {
+  try {
+    // Started from inside the prompt's own hook: wait until that hook has returned and the
+    // held prompt is dropped, or the clear would be asked for while the prompt is in flight.
+    await $.clock.sleep(100)
+    await $.command.run({ command: 'clear' })
+    void $.prompt.submit({ text, asUser: true }).catch(() => undefined)
+  } catch (error) {
+    $.ui.toast(`Could not clear: ${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
+// The guard's answers, compared exactly with what the question dialog returns.
+const GUARD_SEND = 'Send anyway'
+const GUARD_FRESH = 'Start fresh with a brief'
+const GUARD_CLEAR = 'Clear and send, no brief'
+const GUARD_CANCEL = 'Cancel'
 
 /** Keep the latest 5-hour window figure. */
 function rememberLimits(limits: readonly SessionRateLimit[]) {
@@ -364,6 +388,7 @@ export const register: Register = (on, options) => {
     compactAtTokens: positive(options.compactAtTokens, 100_000),
   }
   const wantToast = options.toast !== false
+  const wantGuard = options.guard !== false
 
   on('session.start', async ($, e, next) => {
     const r = await next(e)
@@ -413,7 +438,7 @@ export const register: Register = (on, options) => {
     timer = $.clock.every(1000, () => {
       const now = Date.now()
       const { last, advice, left } = current(policy, now)
-      const key = `${advice.kind}|${advice.text}|${left > 0 ? fmtClock(left) : ''}`
+      const key = `${advice.kind}|${advice.text}|${left > 0 ? calmClock(left) : ''}`
       if (key !== lastKey) {
         lastKey = key
         $.ui.invalidate('ui.render')
@@ -453,6 +478,52 @@ export const register: Register = (on, options) => {
     timer = undefined
 
     return next(e)
+  })
+
+  // The guard: a message typed after the cache expired on a big conversation re-writes all
+  // of it at full price. Ask first. Only the person's own typed prompts are held; slash
+  // commands and prompts a plugin sends pass.
+  on('prompt.submit', async ($, e, next) => {
+    if (!wantGuard || e.origin?.kind !== 'composer' || e.text.trimStart().startsWith('/')) {
+      return next(e)
+    }
+    const { last, left } = current(policy, Date.now())
+    if (!last || left > 0 || promptTokens(last) < policy.compactAtTokens) {
+      return next(e)
+    }
+
+    const size = promptTokens(last)
+    const cost = percentOf(reingestUnits(size, ttlMs(ttl)))
+    let answer = GUARD_CANCEL
+    try {
+      answer = await $.ui.ask(
+        `The prompt cache expired. This message will re-write ${fmtTokens(size)} tokens` +
+          `${cost ? `, about ${cost} of your 5-hour limit` : ''}. ` +
+          'Starting fresh costs the same once (the brief re-reads the conversation) but makes every later ' +
+          'request cheap; clearing without a brief skips the cost and Claude forgets this conversation. What now?',
+        { header: 'Cache expired', options: [GUARD_SEND, GUARD_FRESH, GUARD_CLEAR, GUARD_CANCEL] },
+      )
+    } catch {
+      // Dismissed: treat it as Cancel, so nothing expensive happens by accident.
+    }
+
+    if (answer === GUARD_SEND) {
+      return next(e)
+    }
+    // The other paths run after this hook returns: /clear only runs once the session is idle.
+    if (answer === GUARD_FRESH) {
+      void startFresh($, e.text)
+
+      return { drop: 'Starting fresh: your message follows the handoff brief.' }
+    }
+    if (answer === GUARD_CLEAR) {
+      void clearAndSend($, e.text)
+
+      return { drop: 'Clearing, then sending your message to a new conversation.' }
+    }
+    void $.prompt.fill({ text: e.text }).catch(() => undefined)
+
+    return { drop: 'Not sent: the cache had expired. Your message is back in the prompt box.' }
   })
 
   on('session.measure', async ($, e, next) => {
@@ -584,7 +655,7 @@ export const register: Register = (on, options) => {
           {/* The conversation's size; the read / wrote / new split is in the pane. */}
           <Text dimColor>{`${fmtTokens(size)} tok`}</Text>
           {advice.kind !== 'uncached' && advice.kind !== 'off' && (
-            <Text bold color={left > 0 ? lifeColor(left, ttl, policy.warnMs) : 'red'}>{left > 0 ? `⏱ ${fmtClock(left)}` : '⏱ 0:00'}</Text>
+            <Text bold color={left > 0 ? lifeColor(left, ttl, policy.warnMs) : 'red'}>{left > 0 ? `⏱ ${calmClock(left)}` : '⏱ 0:00'}</Text>
           )}
           <Box flexGrow={1} flexShrink={1} minWidth={0} overflow="hidden">
             <Text dimColor wrap="truncate-end">{`${ttl} · ${status}`}</Text>
@@ -655,7 +726,7 @@ export const register: Register = (on, options) => {
         </Box>
 
         <Box key="clock" flexDirection="column" marginTop={1}>
-          <Text bold color={clockColor}>{sp(counting ? `⏱ ${left > 0 ? fmtClock(left) : '0:00'}` : '⏱ --:--')}</Text>
+          <Text bold color={clockColor}>{sp(counting ? `⏱ ${left > 0 ? calmClock(left) : '0:00'}` : '⏱ --:--')}</Text>
           {counting ? (
             <Box flexDirection="row" columnGap={1}>
               {solid('life', [[lifeFilled, clockColor], [barW - lifeFilled, 'gray']])}

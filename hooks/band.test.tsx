@@ -6,11 +6,11 @@ import { expect, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-type Calls = { ran: string[]; sent: string[]; toasts: string[]; opened: string[] }
+type Calls = { ran: string[]; sent: string[]; toasts: string[]; opened: string[]; filled: string[]; asked: string[]; answer: string }
 
 /** The engine beneath the plugin: one main request that read 80k from the cache. */
 function fakeEngine(on: On, fork: object = { isAnswered: true, text: 'Goal: ship it.' }, saved?: object): Calls {
-  const calls: Calls = { ran: [], sent: [], toasts: [], opened: [] }
+  const calls: Calls = { ran: [], sent: [], toasts: [], opened: [], filled: [], asked: [], answer: 'Send anyway' }
   on('session.usage', () => ({ value: { startedAt: 0, context: {}, rateLimits: [{ kind: 'five_hour', percentUsed: 40 }] } }) as never)
   on('session.start', async ($, e) => ({ cwd: e.cwd }) as never)
   on('session.cwd', () => ({ value: 'D:/repo' }) as never)
@@ -23,6 +23,7 @@ function fakeEngine(on: On, fork: object = { isAnswered: true, text: 'Goal: ship
   on('store.set', () => ({ value: undefined }) as never)
   on('command.register', () => ({ value: undefined }) as never)
   on('clock.every', () => ({ value: undefined }) as never)
+  on('clock.sleep', () => ({ value: undefined }) as never)
   on('ui.invalidate', () => ({ value: undefined }) as never)
   on('ui.open', ($, e) => {
     calls.opened.push(String((e as { id: unknown }).id))
@@ -44,7 +45,19 @@ function fakeEngine(on: On, fork: object = { isAnswered: true, text: 'Goal: ship
   on('prompt.submit', ($, e) => {
     calls.sent.push(e.text)
 
-    return { value: { turnId: 't' } } as never
+    return { text: e.text } as never
+  })
+  on('prompt.fill', ($, e) => {
+    calls.filled.push((e as { text: string }).text)
+
+    return { isFilled: true } as never
+  })
+  // The guard's question: answered with whatever the test set.
+  on('tool.call', { tool: 'AskUserQuestion' }, ($, e) => {
+    const questions = (e as { questions: Array<{ question: string }> }).questions
+    calls.asked.push(questions[0].question)
+
+    return { result: { questions, answers: { [questions[0].question]: calls.answer } } } as never
   })
   on('turn.step', async function* ($, e) {
     return {
@@ -167,4 +180,68 @@ test('if the brief cannot be written, nothing is cleared', async ($, on) => {
 
   expect(calls.ran).toEqual([])
   expect(calls.sent).toEqual([])
+})
+
+// ---- The guard: a message typed after the cache expired on a big conversation.
+
+/** A reopened session whose 300k-token conversation went cold two hours ago. */
+async function coldSession($: Engine, on: On, answer: string) {
+  const last = { turnId: 't0', index: 0, model: 'claude-opus-5-5', startedAt: Date.now() - 2 * 3_600_000, read: 300_000, write: 2_000, fresh: 100, output: 50 }
+  const calls = fakeEngine(on, { isAnswered: true, text: 'Goal: ship it.' }, { s1: last })
+  calls.answer = answer
+  await $.session.start({ cwd: 'D:/repo', surface: 'desktop', isInteractive: true } as never)
+
+  return calls
+}
+
+const typed = (text: string) => ({ text, wait: false, origin: { kind: 'composer' } }) as never
+/** Let work the guard left running (clear, then send) finish. */
+const settle = () => new Promise(resolve => setTimeout(resolve, 30))
+
+test('guard: Send anyway lets the message through', async ($, on) => {
+  const calls = await coldSession($, on, 'Send anyway')
+  const result = await $.prompt.submit(typed('carry on'))
+  expect(calls.asked.length).toBe(1)
+  expect((result as { text?: string }).text).toBe('carry on')
+  expect(calls.ran).toEqual([])
+})
+
+test('guard: Cancel holds the message and puts it back in the prompt box', async ($, on) => {
+  const calls = await coldSession($, on, 'Cancel')
+  const result = await $.prompt.submit(typed('carry on'))
+  expect((result as { drop?: string }).drop).toContain('Not sent')
+  await settle()
+  expect(calls.filled).toEqual(['carry on'])
+  expect(calls.sent).toEqual([])
+})
+
+test('guard: Clear and send starts a new conversation with only the message', async ($, on) => {
+  const calls = await coldSession($, on, 'Clear and send, no brief')
+  const result = await $.prompt.submit(typed('carry on'))
+  expect((result as { drop?: string }).drop).toContain('Clearing')
+  await settle()
+  expect(calls.ran).toEqual(['clear'])
+  expect(calls.sent).toEqual(['carry on'])
+})
+
+test('guard: Start fresh sends the brief with the message after it', async ($, on) => {
+  const calls = await coldSession($, on, 'Start fresh with a brief')
+  await $.prompt.submit(typed('carry on'))
+  await settle()
+  expect(calls.ran).toEqual(['clear'])
+  expect(calls.sent.length).toBe(1)
+  expect(calls.sent[0]).toContain('Goal: ship it.')
+  expect(calls.sent[0]).toContain('My message:\ncarry on')
+})
+
+test('guard: slash commands, a warm cache and a switched-off guard are never held', async ($, on) => {
+  const calls = await coldSession($, on, 'Cancel')
+  expect(((await $.prompt.submit(typed('/cache'))) as { text?: string }).text).toBe('/cache')
+  expect(calls.asked.length).toBe(0)
+})
+
+test('guard: off by setting', { options: { guard: false } }, async ($, on) => {
+  const calls = await coldSession($, on, 'Cancel')
+  expect(((await $.prompt.submit(typed('carry on'))) as { text?: string }).text).toBe('carry on')
+  expect(calls.asked.length).toBe(0)
 })
