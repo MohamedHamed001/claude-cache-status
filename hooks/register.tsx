@@ -278,35 +278,67 @@ async function keepWarm($: EngineInterface, options: Record<string, unknown>) {
   }
 }
 
+// Start fresh's answers, compared exactly with what the question dialog returns.
+const FRESH_CLEAR = 'Clear and send the brief'
+const FRESH_COPY = 'Copy the brief for a new chat'
+
 /**
- * Start fresh: Claude writes a handoff brief, the conversation is cleared, and the brief
- * is sent as the new conversation's first message (with `followUp`, the message the guard
- * held back, after it). If the brief cannot be written, nothing is cleared.
+ * Start fresh: asks which way, then Claude writes a handoff brief (with `followUp`, the
+ * message the guard held back, after it). "Clear" clears this conversation and sends the
+ * brief as its first message; "Copy" leaves this conversation alone and puts the brief on
+ * the clipboard, to paste into a new chat (a plugin cannot open one). A dismissed question
+ * or a brief that cannot be written changes nothing.
  */
 async function startFresh($: EngineInterface, followUp?: string) {
   if (freshState !== 'idle') return
   freshState = 'writing'
   $.ui.invalidate('ui.render')
   try {
+    // Asked before the brief is written, so backing out costs nothing.
+    let answer = ''
+    try {
+      answer = await $.ui.ask(
+        'Start fresh: clear this conversation and send the brief here (the old one stays under ' +
+          '"Resume previous session"), or keep this conversation and copy the brief for a new chat?',
+        { header: 'Start fresh', options: [FRESH_CLEAR, FRESH_COPY] },
+      )
+    } catch {
+      // Dismissed.
+    }
+    if (answer !== FRESH_CLEAR && answer !== FRESH_COPY) return
+
     // Reads the conversation through the cache: cheap while it is warm.
     const reply = await $.model.fork({ prompt: BRIEF_PROMPT })
     if (!reply.isAnswered) {
       $.ui.toast(`Could not write the handoff brief (${reply.reason}). Nothing was cleared.`)
       return
     }
+    const brief = reply.text.trim() + (followUp ? `\n\nMy message:\n${followUp}` : '')
+
+    if (answer === FRESH_COPY) {
+      const text = `Handoff brief from a previous conversation:\n\n${brief}`
+      const copy = await $.ui.copy({ text })
+      if (copy.isCopied) {
+        $.ui.toast('Brief copied: open a new chat and paste it')
+      } else {
+        // No clipboard on this surface: the prompt box is the next best place to take it from.
+        void $.prompt.fill({ text }).catch(() => undefined)
+        $.ui.toast('Could not reach the clipboard: the brief is in the prompt box, cut it into a new chat')
+      }
+      return
+    }
+
     freshState = 'clearing'
     $.ui.invalidate('ui.render')
     await $.command.run({ command: 'clear' })
     // Not awaited: it is queued and starts once the cleared session is idle.
     void $.prompt
       .submit({
-        text:
-          `Handoff brief from the previous conversation, which was cleared to start fresh:\n\n${reply.text.trim()}` +
-          (followUp ? `\n\nMy message:\n${followUp}` : ''),
+        text: `Handoff brief from the previous conversation, which was cleared to start fresh:\n\n${brief}`,
         asUser: true,
       })
       .catch(() => undefined)
-    $.ui.toast('Started fresh: handoff brief sent')
+    $.ui.toast('Started fresh: brief sent. The old conversation is under "Resume previous session"')
   } catch (error) {
     $.ui.toast(`Start fresh failed: ${error instanceof Error ? error.message : String(error)}`)
   } finally {
@@ -514,7 +546,7 @@ export const register: Register = (on, options) => {
     if (answer === GUARD_FRESH) {
       void startFresh($, e.text)
 
-      return { drop: 'Starting fresh: your message follows the handoff brief.' }
+      return { drop: 'Starting fresh: your message goes after the handoff brief.' }
     }
     if (answer === GUARD_CLEAR) {
       void clearAndSend($, e.text)

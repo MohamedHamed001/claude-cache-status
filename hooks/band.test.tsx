@@ -6,11 +6,40 @@ import { expect, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-type Calls = { ran: string[]; sent: string[]; toasts: string[]; opened: string[]; filled: string[]; asked: string[]; answer: string }
+type Calls = {
+  ran: string[]
+  sent: string[]
+  toasts: string[]
+  opened: string[]
+  filled: string[]
+  asked: string[]
+  copied: string[]
+  /** The guard's answer. */
+  answer: string
+  /** Start fresh's answer. */
+  fresh: string
+  canCopy: boolean
+}
 
 /** The engine beneath the plugin: one main request that read 80k from the cache. */
 function fakeEngine(on: On, fork: object = { isAnswered: true, text: 'Goal: ship it.' }, saved?: object): Calls {
-  const calls: Calls = { ran: [], sent: [], toasts: [], opened: [], filled: [], asked: [], answer: 'Send anyway' }
+  const calls: Calls = {
+    ran: [],
+    sent: [],
+    toasts: [],
+    opened: [],
+    filled: [],
+    asked: [],
+    copied: [],
+    answer: 'Send anyway',
+    fresh: 'Clear and send the brief',
+    canCopy: true,
+  }
+  on('ui.copy', ($, e) => {
+    if (calls.canCopy) calls.copied.push((e as { text: string }).text)
+
+    return { value: calls.canCopy ? { isCopied: true } : { isCopied: false, reason: 'no-clipboard' } } as never
+  })
   on('session.usage', () => ({ value: { startedAt: 0, context: {}, rateLimits: [{ kind: 'five_hour', percentUsed: 40 }] } }) as never)
   on('session.start', async ($, e) => ({ cwd: e.cwd }) as never)
   on('session.cwd', () => ({ value: 'D:/repo' }) as never)
@@ -52,12 +81,14 @@ function fakeEngine(on: On, fork: object = { isAnswered: true, text: 'Goal: ship
 
     return { isFilled: true } as never
   })
-  // The guard's question: answered with whatever the test set.
+  // The guard's question and Start fresh's: each answered with whatever the test set.
   on('tool.call', { tool: 'AskUserQuestion' }, ($, e) => {
     const questions = (e as { questions: Array<{ question: string }> }).questions
-    calls.asked.push(questions[0].question)
+    const question = questions[0].question
+    const isFresh = question.startsWith('Start fresh:')
+    if (!isFresh) calls.asked.push(question)
 
-    return { result: { questions, answers: { [questions[0].question]: calls.answer } } } as never
+    return { result: { questions, answers: { [question]: isFresh ? calls.fresh : calls.answer } } } as never
   })
   on('turn.step', async function* ($, e) {
     return {
@@ -169,6 +200,48 @@ test('Start fresh writes the brief, clears, then sends the brief', async ($, on)
   expect(calls.ran).toEqual(['clear'])
   expect(calls.sent.length).toBe(1)
   expect(calls.sent[0]).toContain('Goal: ship it.')
+})
+
+test('Start fresh, copy: the brief goes to the clipboard and nothing is cleared', async ($, on) => {
+  const calls = fakeEngine(on)
+  calls.fresh = 'Copy the brief for a new chat'
+  await $.session.start({ cwd: 'D:/repo', surface: 'desktop', isInteractive: true } as never)
+  await step($)
+  const ui = await pane($)
+  await ui.press({ key: 'pane-start-fresh' })
+
+  expect(calls.ran).toEqual([])
+  expect(calls.sent).toEqual([])
+  expect(calls.copied.length).toBe(1)
+  expect(calls.copied[0]).toContain('Goal: ship it.')
+})
+
+test('Start fresh, copy with no clipboard: the brief lands in the prompt box', async ($, on) => {
+  const calls = fakeEngine(on)
+  calls.fresh = 'Copy the brief for a new chat'
+  calls.canCopy = false
+  await $.session.start({ cwd: 'D:/repo', surface: 'desktop', isInteractive: true } as never)
+  await step($)
+  const ui = await pane($)
+  await ui.press({ key: 'pane-start-fresh' })
+  await settle()
+
+  expect(calls.ran).toEqual([])
+  expect(calls.filled.length).toBe(1)
+  expect(calls.filled[0]).toContain('Goal: ship it.')
+})
+
+test('Start fresh, question dismissed: no brief is written and nothing is cleared', async ($, on) => {
+  const calls = fakeEngine(on)
+  calls.fresh = ''
+  await $.session.start({ cwd: 'D:/repo', surface: 'desktop', isInteractive: true } as never)
+  await step($)
+  const ui = await pane($)
+  await ui.press({ key: 'pane-start-fresh' })
+
+  expect(calls.ran).toEqual([])
+  expect(calls.copied).toEqual([])
+  expect(calls.toasts).toEqual([])
 })
 
 test('if the brief cannot be written, nothing is cleared', async ($, on) => {

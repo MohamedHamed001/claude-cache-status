@@ -64,10 +64,18 @@ conversations of 20k tokens or more. After a re-ingest a pop-up says what it cos
 cache. A cache hit restarts the cache's lifetime, so for about a tenth of the conversation's
 size it buys another full lifetime instead of a full re-ingest later.
 
-**Start fresh** (once expired on a big conversation, and always in the pane). Claude writes a
-handoff brief (goal, what is done, files, decisions, open questions, next step), the
-conversation is cleared with `/clear`, and the brief is sent as the new conversation's first
-message. If the brief cannot be written, nothing is cleared. Writing the brief reads the whole
+**Start fresh** (once expired on a big conversation, and always in the pane). It asks which
+way each time, then Claude writes a handoff brief (goal, what is done, files, decisions, open
+questions, next step):
+
+- **Clear and send the brief**: the conversation is cleared with `/clear` and the brief is
+  sent as the new conversation's first message. The old conversation stays under "Resume
+  previous session".
+- **Copy the brief for a new chat**: this conversation is left alone and the brief goes to the
+  clipboard, to paste into a new chat (a plugin cannot open one). If the clipboard cannot be
+  reached, the brief is put in the prompt box instead.
+
+Dismissing the question does nothing. If the brief cannot be written, nothing is cleared. Writing the brief reads the whole
 conversation once: cheap while the cache is warm, a full re-ingest once it has lapsed, so the
 best time is while it is still warm.
 
@@ -80,7 +88,7 @@ full price.
 | Answer | What happens |
 |---|---|
 | Send anyway | The message goes through |
-| Start fresh with a brief | Handoff brief, `/clear`, then the brief with your message after it. Writing the brief re-reads the conversation once (the same cost), but every later request is cheap |
+| Start fresh with a brief | Start fresh's own question (clear or copy), then the handoff brief with your message after it. Writing the brief re-reads the conversation once (the same cost), but every later request is cheap |
 | Clear and send, no brief | `/clear`, then only your message: no re-read, and Claude forgets this conversation |
 | Cancel (or dismissing the question) | Nothing is sent; your message goes back in the prompt box |
 
